@@ -1,0 +1,14 @@
+services:
+  backup:
+    # DNS configuration for production hostname resolution
+    # dns:
+    #   - 192.168.11.19  # Prod DNS server
+
+    environment:
+      - APP_ENV=production
+
+      # PostgreSQL connection for backups
+      - POSTGRES_HOST=10.128.0.3
+      - POSTGRES_USER=${POSTGRES_USER:-alanpg}
+      - POSTGRES_PASS=${POSTGRES_PASSWORD:-pK20Ht492ynfkmshaN7}
+      - POSTGRES_DB=${POSTGRES_DB:-alandb}

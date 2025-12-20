@@ -1,0 +1,85 @@
+services:
+  backup:
+    build:
+      context: .
+    container_name: alan_backup_service
+    restart: unless-stopped
+    volumes:
+      # Backup storage location
+      - /mnt/shared/alan/backups:/backups
+
+      # Access to volumes we need to backup
+      - rabbitmq_data:/source/rabbitmq_data:ro
+      - rabbitmq_logs:/source/rabbitmq_logs:ro
+      - loki-data:/source/loki-data:ro
+      - grafana-data:/source/grafana-data:ro
+
+      # Backup scripts (removed :ro so chmod can work)
+      - ./scripts/backup.sh:/usr/local/bin/backup.sh
+      - ./scripts/notify.sh:/usr/local/bin/notify.sh
+
+      # Status files for API integration (will be created by backup script)
+      - /mnt/shared/alan/services:/services
+
+      # Docker socket for PostgreSQL backup via docker exec
+      - /var/run/docker.sock:/var/run/docker.sock
+
+    networks:
+      - alan_network
+
+    # DNS configuration for hostname resolution
+    # dns:
+    #   - 172.16.111.7  # Dev DNS server
+
+    environment:
+      # Backup configuration
+      - BACKUP_SCHEDULE=0 3 * * *  # 3 AM PST/PDT daily
+      - RETENTION_DAILY=7
+      - RETENTION_WEEKLY=4
+      - TZ=America/Los_Angeles
+
+      # Environment and notification configuration
+      - APP_ENV=${APP_ENV:-development}
+      - NOTIFICATION_EMAIL=${NOTIFICATION_EMAIL:-admin@gphusa.com}
+
+      # RabbitMQ API access for definitions backup
+      - RABBITMQ_HOST=rabbitmq
+      - RABBITMQ_PORT=15672
+      - RABBITMQ_USER=${RABBITMQ_DEFAULT_USER:-guest}
+      - RABBITMQ_PASS=${RABBITMQ_DEFAULT_PASS:-guest}
+
+      # PostgreSQL connection for backups
+      - POSTGRES_HOST=161.97.145.138
+      - POSTGRES_USER=${POSTGRES_USER:-alanpg}
+      - POSTGRES_PASS=${POSTGRES_PASSWORD:-LjEZY7v2nr08w}
+      - POSTGRES_DB=${POSTGRES_DB:-alandb}
+
+    # Setup and run cron (packages are pre-installed in Dockerfile)
+    entrypoint: |
+      sh -c "
+        chmod +x /usr/local/bin/backup.sh /usr/local/bin/notify.sh && \
+        mkdir -p /backups/rabbitmq/daily /backups/rabbitmq/weekly /backups/loki/daily /backups/loki/weekly /backups/grafana/daily /backups/grafana/weekly /backups/postgresql/daily /backups/postgresql/weekly && \
+        mkdir -p /status && \
+        echo \"$$BACKUP_SCHEDULE /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1\" > /etc/crontabs/root && \
+        echo \"Backup service started. Schedule: $$BACKUP_SCHEDULE (no initial backup on restart)\" && \
+        crond -f -d 8
+      "
+
+volumes:
+  # External volumes from other services
+  rabbitmq_data:
+    external: true
+    name: rabbitmq-broker_rabbitmq_data
+  rabbitmq_logs:
+    external: true
+    name: rabbitmq-broker_rabbitmq_logs
+  loki-data:
+    external: true
+    name: alan-loki_loki-data
+  grafana-data:
+    external: true
+    name: alan-loki_grafana-data
+
+networks:
+  alan_network:
+    external: true
