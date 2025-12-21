@@ -69,10 +69,10 @@ volumes:
   # External volumes from other services
   rabbitmq_data:
     external: true
-    name: rabbitmq-broker_rabbitmq_data
+    name: alan-broker_rabbitmq_data
   rabbitmq_logs:
     external: true
-    name: rabbitmq-broker_rabbitmq_logs
+    name: alan-broker_rabbitmq_logs
   loki-data:
     external: true
     name: alan-loki_loki-data
