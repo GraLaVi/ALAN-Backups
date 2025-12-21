@@ -32,7 +32,7 @@ send_api_notification() {
     if [ "${APP_ENV}" = "production" ]; then
         api_url="https://api.gphusa.com/alan/process"
     else
-        api_url="https://161.97.145.138:8000/alan/process"
+        api_url="http://75.119.134.30:8000/alan/process"
     fi
 
     log "Sending notification via API (${APP_ENV} environment)..."

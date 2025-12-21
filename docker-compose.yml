@@ -21,7 +21,7 @@ services:
       # Status files for API integration (will be created by backup script)
       - /mnt/shared/alan/services:/services
 
-      # Docker socket for PostgreSQL backup via docker exec
+      # Docker socket (no longer used for PostgreSQL, but kept for potential future use)
       - /var/run/docker.sock:/var/run/docker.sock
 
     networks:

@@ -124,8 +124,9 @@ get_database_size() {
     local db_name=$1
     local size_bytes
     
-    # Query database size from PostgreSQL
-    size_bytes=$(docker exec postgres_db psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB:-postgres}" -t -A -c "SELECT pg_database_size('${db_name}');" 2>/dev/null | tr -d ' ' || echo "0")
+    # Query database size from PostgreSQL (native connection)
+    # Use PGPASSWORD for authentication
+    size_bytes=$(PGPASSWORD="${POSTGRES_PASS}" psql -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT:-5432}" -U "${POSTGRES_USER}" -d "${POSTGRES_DB:-postgres}" -t -A -c "SELECT pg_database_size('${db_name}');" 2>/dev/null | tr -d ' ' || echo "0")
     
     # Return 0 if query failed
     if [ -z "$size_bytes" ] || [ "$size_bytes" = "0" ]; then
@@ -328,6 +329,22 @@ backup_grafana() {
     fi
 }
 
+# Escape string for JSON (escape quotes, backslashes, newlines, etc.)
+escape_json_string() {
+    local str="$1"
+    # Escape backslashes first
+    str="${str//\\/\\\\}"
+    # Escape quotes
+    str="${str//\"/\\\"}"
+    # Escape newlines
+    str="${str//$'\n'/\\n}"
+    # Escape carriage returns
+    str="${str//$'\r'/\\r}"
+    # Escape tabs
+    str="${str//$'\t'/\\t}"
+    echo "$str"
+}
+
 # Update PostgreSQL database status file
 update_postgresql_db_status() {
     local db_name=$1
@@ -338,20 +355,58 @@ update_postgresql_db_status() {
     local backup_file=$6
     local error_detail=$7
 
-    cat > "${STATUS_ROOT}/postgresql_${db_name}_last_backup.json" <<EOF
+    # Escape strings for JSON
+    local escaped_db_name=$(escape_json_string "${db_name}")
+    local escaped_status=$(escape_json_string "${status}")
+    local escaped_message=$(escape_json_string "${message}")
+    local escaped_backup_file=$(escape_json_string "${backup_file:-none}")
+    local escaped_error_detail=""
+    
+    if [ -n "$error_detail" ]; then
+        escaped_error_detail=$(escape_json_string "$error_detail")
+    fi
+
+    # Ensure numeric fields are valid (default to 0 if empty or not a number)
+    local size_value=${size:-0}
+    local duration_value=${duration:-0}
+    # Validate they are numeric
+    if ! echo "$size_value" | grep -qE '^-?[0-9]+$'; then
+        size_value=0
+    fi
+    if ! echo "$duration_value" | grep -qE '^-?[0-9]+$'; then
+        duration_value=0
+    fi
+
+    if [ -n "$error_detail" ]; then
+        cat > "${STATUS_ROOT}/postgresql_${db_name}_last_backup.json" <<EOF
 {
   "service": "postgresql",
-  "database": "${db_name}",
-  "status": "${status}",
-  "message": "${message}",
+  "database": "${escaped_db_name}",
+  "status": "${escaped_status}",
+  "message": "${escaped_message}",
   "timestamp": "$(date -Iseconds)",
   "backup_date": "${DATE}",
-  "backup_file": "${backup_file:-none}",
-  "size_bytes": ${size:-0},
-  "duration_seconds": ${duration:-0}${error_detail:+,
-  "error_detail": "${error_detail}"}
+  "backup_file": "${escaped_backup_file}",
+  "size_bytes": ${size_value},
+  "duration_seconds": ${duration_value},
+  "error_detail": "${escaped_error_detail}"
 }
 EOF
+    else
+        cat > "${STATUS_ROOT}/postgresql_${db_name}_last_backup.json" <<EOF
+{
+  "service": "postgresql",
+  "database": "${escaped_db_name}",
+  "status": "${escaped_status}",
+  "message": "${escaped_message}",
+  "timestamp": "$(date -Iseconds)",
+  "backup_date": "${DATE}",
+  "backup_file": "${escaped_backup_file}",
+  "size_bytes": ${size_value},
+  "duration_seconds": ${duration_value}
+}
+EOF
+    fi
 }
 
 # Backup PostgreSQL
@@ -382,10 +437,10 @@ backup_postgresql() {
     
     # Query databases, using POSTGRES_DB (since we know it works for pg_dump)
     log "Connecting to database '${connect_db}' to query database list..."
-    if ! query_output=$(docker exec postgres_db psql -U "${POSTGRES_USER}" -d "${connect_db}" -t -A -c "SELECT datname FROM pg_database WHERE datistemplate = false AND datname != 'postgres';" 2>&1); then
-        log "ERROR: docker exec command failed"
+    if ! query_output=$(PGPASSWORD="${POSTGRES_PASS}" psql -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT:-5432}" -U "${POSTGRES_USER}" -d "${connect_db}" -t -A -c "SELECT datname FROM pg_database WHERE datistemplate = false AND datname != 'postgres';" 2>&1); then
+        log "ERROR: psql query command failed"
         log "Error output: $query_output"
-        update_postgresql_db_status "unknown" "failed" "Failed to execute database query" 0 $((($(date +%s) - overall_start_time))) "none" "docker exec command failed"
+        update_postgresql_db_status "unknown" "failed" "Failed to execute database query" 0 $((($(date +%s) - overall_start_time))) "none" "psql query command failed"
         return 1
     fi
     
@@ -493,20 +548,65 @@ backup_postgresql() {
         ) &
         progress_pid=$!
         
-        # Perform backup via docker exec with timeout
+        # Perform backup via native PostgreSQL connection
         local error_msg=""
         local pg_dump_exit_code=0
         
         log "Starting pg_dump for ${db_name} (timeout: ${BACKUP_TIMEOUT}s)..."
         
-        # Run pg_dump with timeout, capturing both stdout and stderr
-        # Use a subshell to properly capture exit codes from the pipeline
-        (
-            run_with_timeout "${BACKUP_TIMEOUT}" docker exec postgres_db pg_dump -U "${POSTGRES_USER}" -d "${db_name}" 2>&1 | \
-            gzip > "${temp_file}" 2>&1
-        ) > "${error_log}" 2>&1
+        # Run pg_dump first to a temporary uncompressed file to properly capture exit code
+        # Then gzip the result, so we can check pg_dump's exit code separately
+        local temp_sql_file="${target_dir}/${db_name}-${TIMESTAMP}.sql.tmp"
         
-        pg_dump_exit_code=$?
+        # Run pg_dump with timeout, capturing both stdout and stderr separately
+        # Use a temp file for stderr to check for errors even if exit code is 0
+        local pg_dump_stderr="${temp_sql_file}.stderr"
+        set +o pipefail  # Disable pipefail temporarily
+        if ! PGPASSWORD="${POSTGRES_PASS}" run_with_timeout "${BACKUP_TIMEOUT}" pg_dump -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT:-5432}" -U "${POSTGRES_USER}" -d "${db_name}" > "${temp_sql_file}" 2>"${pg_dump_stderr}"; then
+            pg_dump_exit_code=$?
+        else
+            pg_dump_exit_code=0
+        fi
+        set -o pipefail  # Re-enable pipefail
+        
+        # Check if there are errors in stderr (even if exit code is 0)
+        if [ -s "${pg_dump_stderr}" ]; then
+            cat "${pg_dump_stderr}" >> "${error_log}"
+            # If stderr has content, it might indicate a problem
+            local stderr_content=$(cat "${pg_dump_stderr}")
+            if echo "$stderr_content" | grep -qi "error\|failed\|fatal"; then
+                pg_dump_exit_code=1
+                log "WARNING: pg_dump produced error messages in stderr"
+            fi
+        fi
+        rm -f "${pg_dump_stderr}"
+        
+        # Check if temp_sql_file exists and has content
+        if [ ! -f "${temp_sql_file}" ]; then
+            log "ERROR: pg_dump did not create output file"
+            pg_dump_exit_code=1
+        elif [ ! -s "${temp_sql_file}" ]; then
+            log "ERROR: pg_dump output file is empty"
+            pg_dump_exit_code=1
+            # Show error log content for debugging
+            if [ -s "${error_log}" ]; then
+                log "pg_dump error output: $(head -20 "${error_log}")"
+            fi
+        else
+            local temp_file_size=$(stat -c%s "${temp_sql_file}" 2>/dev/null || echo 0)
+            log "pg_dump completed: ${temp_file_size} bytes written to temp file"
+        fi
+        
+        # If pg_dump succeeded and file has content, compress the output
+        if [ $pg_dump_exit_code -eq 0 ] && [ -s "${temp_sql_file}" ]; then
+            if ! gzip -c "${temp_sql_file}" > "${temp_file}" 2>>"${error_log}"; then
+                pg_dump_exit_code=1
+                log "ERROR: Failed to compress backup file"
+            fi
+            rm -f "${temp_sql_file}"
+        else
+            rm -f "${temp_sql_file}"
+        fi
         
         # Signal progress monitor to stop
         touch "${temp_file}.complete" 2>/dev/null || true
