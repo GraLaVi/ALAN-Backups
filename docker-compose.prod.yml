@@ -9,6 +9,6 @@ services:
 
       # PostgreSQL connection for backups
       - POSTGRES_HOST=10.128.0.3
-      - POSTGRES_USER=${POSTGRES_USER:-alanpg}
-      - POSTGRES_PASS=${POSTGRES_PASSWORD:-pK20Ht492ynfkmshaN7}
+      - POSTGRES_USER=${POSTGRES_USER:-pgbkup}
+      - POSTGRES_PASS=${POSTGRES_PASSWORD:-wjJf6aYvbw8CMGc0j}
       - POSTGRES_DB=${POSTGRES_DB:-alandb}

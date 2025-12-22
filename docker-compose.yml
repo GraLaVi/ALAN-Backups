@@ -50,8 +50,8 @@ services:
 
       # PostgreSQL connection for backups
       - POSTGRES_HOST=161.97.145.138
-      - POSTGRES_USER=${POSTGRES_USER:-alanpg}
-      - POSTGRES_PASS=${POSTGRES_PASSWORD:-LjEZY7v2nr08w}
+      - POSTGRES_USER=${POSTGRES_USER:-pgbkup}
+      - POSTGRES_PASS=${POSTGRES_PASSWORD:-wjJf6aYvbw8CMGc0j}
       - POSTGRES_DB=${POSTGRES_DB:-alandb}
 
     # Setup and run cron (packages are pre-installed in Dockerfile)

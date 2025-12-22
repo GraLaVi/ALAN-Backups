@@ -187,6 +187,11 @@ main() {
         status="PARTIAL_FAILURE"
         subject="Alan Backup: Warning - ${FAILED_COUNT} service(s) failed"
     fi
+    
+    # Add environment label to subject for dev environment only
+    if [ "${APP_ENV}" = "development" ]; then
+        subject="${subject} (DEV)"
+    fi
 
     # Generate email body
     email_body=$(generate_email_body "$status")
