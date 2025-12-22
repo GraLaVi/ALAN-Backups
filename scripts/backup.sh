@@ -201,16 +201,32 @@ update_status() {
     local size=$4
     local duration=$5
 
+    # Escape strings for JSON
+    local escaped_service=$(escape_json_string "${service}")
+    local escaped_status=$(escape_json_string "${status}")
+    local escaped_message=$(escape_json_string "${message}")
+
+    # Ensure numeric fields are valid (default to 0 if empty or not a number)
+    local size_value=${size:-0}
+    local duration_value=${duration:-0}
+    # Validate they are numeric
+    if ! echo "$size_value" | grep -qE '^-?[0-9]+$'; then
+        size_value=0
+    fi
+    if ! echo "$duration_value" | grep -qE '^-?[0-9]+$'; then
+        duration_value=0
+    fi
+
     cat > "${STATUS_ROOT}/${service}_last_backup.json" <<EOF
 {
-  "service": "${service}",
-  "status": "${status}",
-  "message": "${message}",
+  "service": "${escaped_service}",
+  "status": "${escaped_status}",
+  "message": "${escaped_message}",
   "timestamp": "$(date -Iseconds)",
   "backup_date": "${DATE}",
-  "backup_file": "${service}/daily/backup-${TIMESTAMP}.tar.gz",
-  "size_bytes": ${size:-0},
-  "duration_seconds": ${duration:-0}
+  "backup_file": "${escaped_service}/daily/backup-${TIMESTAMP}.tar.gz",
+  "size_bytes": ${size_value},
+  "duration_seconds": ${duration_value}
 }
 EOF
 }
