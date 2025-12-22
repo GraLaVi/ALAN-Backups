@@ -8,6 +8,10 @@ services:
       # Backup storage location
       - /mnt/shared/alan/backups:/backups
 
+      # Local temporary storage for large backups (used when BACKUP_ROOT is on s3fs)
+      # Files are written here first, then copied to S3 and deleted
+      - /tmp/alan-backups:/tmp/backups
+
       # Access to volumes we need to backup
       - rabbitmq_data:/source/rabbitmq_data:ro
       - rabbitmq_logs:/source/rabbitmq_logs:ro

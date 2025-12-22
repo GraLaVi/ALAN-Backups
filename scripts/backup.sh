@@ -260,13 +260,40 @@ EOF
 backup_rabbitmq() {
     log "Starting RabbitMQ backup..."
     local start_time=$(date +%s)
+    
+    # Check if BACKUP_ROOT is on s3fs - if so, use local storage first
+    local use_local_storage=false
+    local local_backup_dir="/tmp/backups/rabbitmq"
     local backup_dir="${BACKUP_ROOT}/rabbitmq"
+    
+    if is_s3fs_mount "${BACKUP_ROOT}"; then
+        use_local_storage=true
+        log "INFO: BACKUP_ROOT is on s3fs - will write to local storage first, then copy to S3"
+    fi
 
     # Determine if weekly backup (Sunday = 7)
     if [ "$WEEKDAY" -eq 7 ]; then
-        local target_dir="${backup_dir}/weekly"
+        if [ "$use_local_storage" = true ]; then
+            local target_dir="${local_backup_dir}/weekly"
+            local final_target_dir="${backup_dir}/weekly"
+        else
+            local target_dir="${backup_dir}/weekly"
+            local final_target_dir="${target_dir}"
+        fi
     else
-        local target_dir="${backup_dir}/daily"
+        if [ "$use_local_storage" = true ]; then
+            local target_dir="${local_backup_dir}/daily"
+            local final_target_dir="${backup_dir}/daily"
+        else
+            local target_dir="${backup_dir}/daily"
+            local final_target_dir="${target_dir}"
+        fi
+    fi
+    
+    # Create target directories
+    mkdir -p "${target_dir}"
+    if [ "$use_local_storage" = true ]; then
+        mkdir -p "${final_target_dir}"
     fi
 
     local backup_file="${target_dir}/backup-${TIMESTAMP}.tar.gz"
@@ -292,6 +319,21 @@ backup_rabbitmq() {
     local size=$(stat -c%s "${backup_file}" 2>/dev/null || echo 0)
 
     if [ -f "${backup_file}" ]; then
+        # If using local storage first, copy to S3 now
+        if [ "$use_local_storage" = true ]; then
+            local final_backup_file="${final_target_dir}/backup-${TIMESTAMP}.tar.gz"
+            log "Copying backup from local storage to S3..."
+            if cp "${backup_file}" "${final_backup_file}"; then
+                log "Successfully copied backup to S3"
+                # Delete local file after successful copy
+                rm -f "${backup_file}"
+                log "Removed local backup file"
+                backup_file="${final_backup_file}"
+            else
+                log "WARNING: Failed to copy backup to S3, keeping local backup at ${backup_file}"
+            fi
+        fi
+        
         log "RabbitMQ backup completed: ${backup_file} ($(numfmt --to=iec ${size} 2>/dev/null || echo ${size}))"
         update_status "rabbitmq" "success" "Backup completed successfully" "${size}" "${duration}"
         return 0
@@ -306,12 +348,39 @@ backup_rabbitmq() {
 backup_loki() {
     log "Starting Loki backup..."
     local start_time=$(date +%s)
+    
+    # Check if BACKUP_ROOT is on s3fs - if so, use local storage first
+    local use_local_storage=false
+    local local_backup_dir="/tmp/backups/loki"
     local backup_dir="${BACKUP_ROOT}/loki"
+    
+    if is_s3fs_mount "${BACKUP_ROOT}"; then
+        use_local_storage=true
+        log "INFO: BACKUP_ROOT is on s3fs - will write to local storage first, then copy to S3"
+    fi
 
     if [ "$WEEKDAY" -eq 7 ]; then
-        local target_dir="${backup_dir}/weekly"
+        if [ "$use_local_storage" = true ]; then
+            local target_dir="${local_backup_dir}/weekly"
+            local final_target_dir="${backup_dir}/weekly"
+        else
+            local target_dir="${backup_dir}/weekly"
+            local final_target_dir="${target_dir}"
+        fi
     else
-        local target_dir="${backup_dir}/daily"
+        if [ "$use_local_storage" = true ]; then
+            local target_dir="${local_backup_dir}/daily"
+            local final_target_dir="${backup_dir}/daily"
+        else
+            local target_dir="${backup_dir}/daily"
+            local final_target_dir="${target_dir}"
+        fi
+    fi
+    
+    # Create target directories
+    mkdir -p "${target_dir}"
+    if [ "$use_local_storage" = true ]; then
+        mkdir -p "${final_target_dir}"
     fi
 
     local backup_file="${target_dir}/backup-${TIMESTAMP}.tar.gz"
@@ -326,6 +395,21 @@ backup_loki() {
     local size=$(stat -c%s "${backup_file}" 2>/dev/null || echo 0)
 
     if [ -f "${backup_file}" ]; then
+        # If using local storage first, copy to S3 now
+        if [ "$use_local_storage" = true ]; then
+            local final_backup_file="${final_target_dir}/backup-${TIMESTAMP}.tar.gz"
+            log "Copying backup from local storage to S3..."
+            if cp "${backup_file}" "${final_backup_file}"; then
+                log "Successfully copied backup to S3"
+                # Delete local file after successful copy
+                rm -f "${backup_file}"
+                log "Removed local backup file"
+                backup_file="${final_backup_file}"
+            else
+                log "WARNING: Failed to copy backup to S3, keeping local backup at ${backup_file}"
+            fi
+        fi
+        
         log "Loki backup completed: ${backup_file} ($(numfmt --to=iec ${size} 2>/dev/null || echo ${size}))"
         update_status "loki" "success" "Backup completed successfully" "${size}" "${duration}"
         return 0
@@ -340,12 +424,39 @@ backup_loki() {
 backup_grafana() {
     log "Starting Grafana backup..."
     local start_time=$(date +%s)
+    
+    # Check if BACKUP_ROOT is on s3fs - if so, use local storage first
+    local use_local_storage=false
+    local local_backup_dir="/tmp/backups/grafana"
     local backup_dir="${BACKUP_ROOT}/grafana"
+    
+    if is_s3fs_mount "${BACKUP_ROOT}"; then
+        use_local_storage=true
+        log "INFO: BACKUP_ROOT is on s3fs - will write to local storage first, then copy to S3"
+    fi
 
     if [ "$WEEKDAY" -eq 7 ]; then
-        local target_dir="${backup_dir}/weekly"
+        if [ "$use_local_storage" = true ]; then
+            local target_dir="${local_backup_dir}/weekly"
+            local final_target_dir="${backup_dir}/weekly"
+        else
+            local target_dir="${backup_dir}/weekly"
+            local final_target_dir="${target_dir}"
+        fi
     else
-        local target_dir="${backup_dir}/daily"
+        if [ "$use_local_storage" = true ]; then
+            local target_dir="${local_backup_dir}/daily"
+            local final_target_dir="${backup_dir}/daily"
+        else
+            local target_dir="${backup_dir}/daily"
+            local final_target_dir="${target_dir}"
+        fi
+    fi
+    
+    # Create target directories
+    mkdir -p "${target_dir}"
+    if [ "$use_local_storage" = true ]; then
+        mkdir -p "${final_target_dir}"
     fi
 
     local backup_file="${target_dir}/backup-${TIMESTAMP}.tar.gz"
@@ -360,6 +471,21 @@ backup_grafana() {
     local size=$(stat -c%s "${backup_file}" 2>/dev/null || echo 0)
 
     if [ -f "${backup_file}" ]; then
+        # If using local storage first, copy to S3 now
+        if [ "$use_local_storage" = true ]; then
+            local final_backup_file="${final_target_dir}/backup-${TIMESTAMP}.tar.gz"
+            log "Copying backup from local storage to S3..."
+            if cp "${backup_file}" "${final_backup_file}"; then
+                log "Successfully copied backup to S3"
+                # Delete local file after successful copy
+                rm -f "${backup_file}"
+                log "Removed local backup file"
+                backup_file="${final_backup_file}"
+            else
+                log "WARNING: Failed to copy backup to S3, keeping local backup at ${backup_file}"
+            fi
+        fi
+        
         log "Grafana backup completed: ${backup_file} ($(numfmt --to=iec ${size} 2>/dev/null || echo ${size}))"
         update_status "grafana" "success" "Backup completed successfully" "${size}" "${duration}"
         return 0
@@ -454,15 +580,40 @@ EOF
 backup_postgresql() {
     log "Starting PostgreSQL backup..."
     local overall_start_time=$(date +%s)
+    
+    # Check if BACKUP_ROOT is on s3fs - if so, use local storage first
+    local use_local_storage=false
+    local local_backup_dir="/tmp/backups/postgresql"
     local backup_dir="${BACKUP_ROOT}/postgresql"
+    
+    if is_s3fs_mount "${BACKUP_ROOT}"; then
+        use_local_storage=true
+        log "INFO: BACKUP_ROOT is on s3fs - will write to local storage first, then copy to S3"
+    fi
 
     # Determine if weekly backup (Sunday = 7)
     if [ "$WEEKDAY" -eq 7 ]; then
-        local target_dir="${backup_dir}/weekly"
+        if [ "$use_local_storage" = true ]; then
+            local target_dir="${local_backup_dir}/weekly"
+        else
+            local target_dir="${backup_dir}/weekly"
+        fi
         log "Weekly PostgreSQL backup (Sunday)"
+        local final_target_dir="${backup_dir}/weekly"
     else
-        local target_dir="${backup_dir}/daily"
+        if [ "$use_local_storage" = true ]; then
+            local target_dir="${local_backup_dir}/daily"
+        else
+            local target_dir="${backup_dir}/daily"
+        fi
         log "Daily PostgreSQL backup"
+        local final_target_dir="${backup_dir}/daily"
+    fi
+    
+    # Create target directory
+    mkdir -p "${target_dir}"
+    if [ "$use_local_storage" = true ]; then
+        mkdir -p "${final_target_dir}"
     fi
     
     # Create errors directory for preserving error logs
@@ -725,6 +876,23 @@ backup_postgresql() {
         local size=$(stat -c%s "${backup_file}" 2>/dev/null || echo 0)
 
         if [ -f "${backup_file}" ] && [ "${size}" -gt 0 ]; then
+            # If using local storage first, copy to S3 now
+            if [ "$use_local_storage" = true ]; then
+                local final_backup_file="${final_target_dir}/${db_name}-${TIMESTAMP}.sql.gz"
+                log "Copying backup from local storage to S3..."
+                if cp "${backup_file}" "${final_backup_file}"; then
+                    log "Successfully copied backup to S3"
+                    # Delete local file after successful copy
+                    rm -f "${backup_file}"
+                    log "Removed local backup file"
+                    backup_file="${final_backup_file}"
+                    # Recalculate size from final file
+                    size=$(stat -c%s "${backup_file}" 2>/dev/null || echo 0)
+                else
+                    log "WARNING: Failed to copy backup to S3, keeping local backup at ${backup_file}"
+                fi
+            fi
+
             local size_display=$(numfmt --to=iec ${size} 2>/dev/null || echo "${size} bytes")
 
             log "Database ${db_name} backup completed successfully"
