@@ -27,6 +27,25 @@ log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# Check if filesystem is s3fs (which reports incorrect disk space)
+is_s3fs_mount() {
+    local check_path=$1
+    
+    if ! command -v df >/dev/null 2>&1; then
+        return 1  # Can't check, assume not s3fs
+    fi
+    
+    # Get filesystem type using df -T
+    local fstype=$(df -T "$check_path" 2>/dev/null | tail -n +2 | awk '{print $2}' | head -1)
+    
+    # Check if filesystem type indicates s3fs
+    if [ "$fstype" = "fuse.s3fs" ] || [ "$fstype" = "s3fs" ]; then
+        return 0  # It's s3fs
+    fi
+    
+    return 1  # Not s3fs
+}
+
 # Check available disk space
 check_disk_space() {
     local required_bytes=$1
@@ -44,6 +63,12 @@ check_disk_space() {
     # Ensure the path exists
     if [ ! -d "$check_path" ]; then
         log "WARNING: Path '$check_path' does not exist, skipping disk space check"
+        return 0
+    fi
+    
+    # Skip disk space check for s3fs mounts (they report incorrect space)
+    if is_s3fs_mount "$check_path"; then
+        log "INFO: Backup path is on s3fs filesystem - skipping disk space check (s3fs reports incorrect available space)"
         return 0
     fi
     
@@ -451,12 +476,16 @@ backup_postgresql() {
     local query_error
     local connect_db="${POSTGRES_DB:-postgres}"
     
+    # Clean up any stale "unknown" status files from previous failed runs
+    rm -f "${STATUS_ROOT}/postgresql_unknown_last_backup.json" 2>/dev/null || true
+    
     # Query databases, using POSTGRES_DB (since we know it works for pg_dump)
+    # Include postgres database in backups (removed exclusion filter)
     log "Connecting to database '${connect_db}' to query database list..."
-    if ! query_output=$(PGPASSWORD="${POSTGRES_PASS}" psql -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT:-5432}" -U "${POSTGRES_USER}" -d "${connect_db}" -t -A -c "SELECT datname FROM pg_database WHERE datistemplate = false AND datname != 'postgres';" 2>&1); then
+    if ! query_output=$(PGPASSWORD="${POSTGRES_PASS}" psql -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT:-5432}" -U "${POSTGRES_USER}" -d "${connect_db}" -t -A -c "SELECT datname FROM pg_database WHERE datistemplate = false;" 2>&1); then
         log "ERROR: psql query command failed"
         log "Error output: $query_output"
-        update_postgresql_db_status "unknown" "failed" "Failed to execute database query" 0 $((($(date +%s) - overall_start_time))) "none" "psql query command failed"
+        # Don't create "unknown" status file - just log the error and return
         return 1
     fi
     
@@ -470,14 +499,14 @@ backup_postgresql() {
         log "ERROR: Failed to retrieve database list from PostgreSQL"
         log "PostgreSQL error: $query_error"
         log "Full output: $query_output"
-        update_postgresql_db_status "unknown" "failed" "Failed to retrieve database list" 0 $((($(date +%s) - overall_start_time))) "none" "$(echo "$query_error" | head -1)"
+        # Don't create "unknown" status file - just log the error and return
         return 1
     fi
 
     if [ -z "$databases" ]; then
         log "ERROR: No user databases found or failed to retrieve database list from PostgreSQL"
         log "Query output: $query_output"
-        update_postgresql_db_status "unknown" "failed" "No databases found or query failed" 0 $((($(date +%s) - overall_start_time))) "none" "No databases returned from query"
+        # Don't create "unknown" status file - just log the error and return
         return 1
     fi
 
