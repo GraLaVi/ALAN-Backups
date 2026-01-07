@@ -186,6 +186,48 @@ run_with_timeout() {
     fi
 }
 
+# Verify gzip file is valid
+verify_gzip_file() {
+    local file_path=$1
+    
+    if [ ! -f "$file_path" ]; then
+        log "ERROR: File does not exist: $file_path"
+        return 1
+    fi
+    
+    # Test gzip file integrity
+    if gzip -t "$file_path" 2>/dev/null; then
+        return 0
+    else
+        log "ERROR: gzip file validation failed for: $file_path"
+        return 1
+    fi
+}
+
+# Calculate file checksum (MD5)
+calculate_file_checksum() {
+    local file_path=$1
+    
+    if [ ! -f "$file_path" ]; then
+        log "ERROR: File does not exist for checksum calculation: $file_path"
+        echo ""
+        return 1
+    fi
+    
+    # Try md5sum first, fallback to md5 if available
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum "$file_path" | awk '{print $1}'
+        return 0
+    elif command -v md5 >/dev/null 2>&1; then
+        md5 -q "$file_path" 2>/dev/null || echo ""
+        return 0
+    else
+        log "WARNING: Neither md5sum nor md5 command available, cannot calculate checksum"
+        echo ""
+        return 1
+    fi
+}
+
 # Calculate next cron execution time based on BACKUP_SCHEDULE
 # Example: BACKUP_SCHEDULE="0 3 * * *" means 3:00 AM daily
 calculate_next_backup_time() {
@@ -586,6 +628,13 @@ backup_postgresql() {
     local local_backup_dir="/tmp/backups/postgresql"
     local backup_dir="${BACKUP_ROOT}/postgresql"
     
+    # Clean up any stale temp files from previous failed backups
+    if [ -d "${local_backup_dir}" ]; then
+        log "Cleaning up stale temp files from previous backups..."
+        rm -f "${local_backup_dir}"/*.tmp "${local_backup_dir}"/*.sql.tmp "${local_backup_dir}"/*.stderr 2>/dev/null || true
+    fi
+    mkdir -p "${local_backup_dir}"
+    
     if is_s3fs_mount "${BACKUP_ROOT}"; then
         use_local_storage=true
         log "INFO: BACKUP_ROOT is on s3fs - will write to local storage first, then copy to S3"
@@ -794,13 +843,26 @@ backup_postgresql() {
         fi
         
         # If pg_dump succeeded and file has content, compress the output
+        local gzip_error=""
         if [ $pg_dump_exit_code -eq 0 ] && [ -s "${temp_sql_file}" ]; then
-            if ! gzip -c "${temp_sql_file}" > "${temp_file}" 2>>"${error_log}"; then
+            # Capture gzip stderr separately to include in error details
+            local gzip_stderr="${temp_sql_file}.gzip.stderr"
+            if ! gzip -c "${temp_sql_file}" > "${temp_file}" 2>"${gzip_stderr}"; then
                 pg_dump_exit_code=1
+                gzip_error=$(cat "${gzip_stderr}" 2>/dev/null || echo "gzip compression failed")
+                # Append gzip error to error log
+                echo "gzip error:" >> "${error_log}"
+                cat "${gzip_stderr}" >> "${error_log}" 2>/dev/null || true
                 log "ERROR: Failed to compress backup file"
+                log "gzip error: ${gzip_error}"
+                # Clean up temp files on compression failure
+                rm -f "${temp_file}" "${temp_sql_file}" "${gzip_stderr}"
+            else
+                # Compression succeeded, clean up temp files
+                rm -f "${gzip_stderr}" "${temp_sql_file}"
             fi
-            rm -f "${temp_sql_file}"
         else
+            # pg_dump failed or file is empty, clean up temp files
             rm -f "${temp_sql_file}"
         fi
         
@@ -813,14 +875,33 @@ backup_postgresql() {
         
         # Check exit code
         if [ $pg_dump_exit_code -ne 0 ]; then
-            # Read error message from log
-            error_msg=$(cat "${error_log}" 2>/dev/null | head -20 || echo "pg_dump command failed (exit code: ${pg_dump_exit_code})")
+            # Read error message from log - read full log, not just first 20 lines
+            local full_error_log=$(cat "${error_log}" 2>/dev/null || echo "")
+            if [ -z "$full_error_log" ]; then
+                error_msg="Backup command failed (exit code: ${pg_dump_exit_code})"
+            else
+                # Extract error message - prioritize compression errors if present
+                if [ -n "$gzip_error" ]; then
+                    error_msg="Compression failed: ${gzip_error}"
+                    # Also include pg_dump errors if any
+                    local pg_dump_errors=$(echo "$full_error_log" | grep -v "gzip error:" | head -20)
+                    if [ -n "$pg_dump_errors" ]; then
+                        error_msg="${error_msg}. pg_dump output: ${pg_dump_errors}"
+                    fi
+                else
+                    # No compression error, extract pg_dump errors
+                    error_msg=$(echo "$full_error_log" | head -20 | tr '\n' ' ' || echo "Backup command failed (exit code: ${pg_dump_exit_code})")
+                fi
+            fi
             
             # Categorize error
             local error_category="unknown"
             if [ $pg_dump_exit_code -eq 124 ]; then
                 error_category="timeout"
                 error_msg="Backup timed out after ${BACKUP_TIMEOUT} seconds. ${error_msg}"
+            elif [ -n "$gzip_error" ]; then
+                error_category="compression"
+                error_msg="Compression error: ${error_msg}"
             elif echo "$error_msg" | grep -qi "disk\|space\|full\|no space"; then
                 error_category="disk_space"
                 error_msg="Disk space error: ${error_msg}"
@@ -841,6 +922,25 @@ backup_postgresql() {
                 echo "Database size: ${db_size_display}"
                 echo "Duration: $((($(date +%s) - db_start_time))) seconds"
                 echo "Timestamp: $(date -Iseconds)"
+                
+                # Include compression-specific details if compression failed
+                if [ "$error_category" = "compression" ] && [ -n "$gzip_error" ]; then
+                    echo "Compression failure details:"
+                    # Try to get uncompressed file size (file may have been cleaned up)
+                    if [ -f "${temp_sql_file}" ]; then
+                        local uncompressed_size=$(stat -c%s "${temp_sql_file}" 2>/dev/null || echo "unknown")
+                        echo "  Uncompressed file size: ${uncompressed_size} bytes"
+                        # Try to get available disk space
+                        local temp_dir=$(dirname "${temp_file}")
+                        if command -v df >/dev/null 2>&1; then
+                            local available_space=$(df -B1 "$temp_dir" 2>/dev/null | tail -n 1 | awk '{print $4}' || echo "unknown")
+                            echo "  Available space in temp directory: ${available_space} bytes"
+                        fi
+                    else
+                        echo "  Uncompressed file size: unknown (file already cleaned up)"
+                    fi
+                    echo "  gzip error: ${gzip_error}"
+                fi
             } >> "${error_log}"
             
             log "ERROR: PostgreSQL backup failed for database ${db_name} (${error_category})"
@@ -850,8 +950,8 @@ backup_postgresql() {
             local db_end_time=$(date +%s)
             local db_duration=$((db_end_time - db_start_time))
 
-            # Clean up temp file
-            rm -f "${temp_file}"
+            # Clean up all temp files (may have already been cleaned up, but ensure they're gone)
+            rm -f "${temp_file}" "${temp_sql_file}" "${temp_file}.complete" "${temp_sql_file}.gzip.stderr" "${temp_sql_file}.stderr"
 
             # Write failure status for this database
             update_postgresql_db_status "${db_name}" "failed" "Backup failed (${error_category})" 0 "${db_duration}" "none" "${error_msg}"
@@ -879,17 +979,65 @@ backup_postgresql() {
             # If using local storage first, copy to S3 now
             if [ "$use_local_storage" = true ]; then
                 local final_backup_file="${final_target_dir}/${db_name}-${TIMESTAMP}.sql.gz"
-                log "Copying backup from local storage to S3..."
-                if cp "${backup_file}" "${final_backup_file}"; then
-                    log "Successfully copied backup to S3"
-                    # Delete local file after successful copy
-                    rm -f "${backup_file}"
-                    log "Removed local backup file"
-                    backup_file="${final_backup_file}"
-                    # Recalculate size from final file
-                    size=$(stat -c%s "${backup_file}" 2>/dev/null || echo 0)
+                
+                # Pre-copy integrity checks
+                log "Verifying backup file integrity before copying to S3..."
+                if ! verify_gzip_file "${backup_file}"; then
+                    log "ERROR: Backup file failed gzip validation, aborting copy to S3"
+                    log "ERROR: Keeping local backup file at ${backup_file} for manual inspection"
                 else
-                    log "WARNING: Failed to copy backup to S3, keeping local backup at ${backup_file}"
+                    # Calculate checksum and size before copy
+                    local local_checksum=$(calculate_file_checksum "${backup_file}")
+                    local local_size=$(stat -c%s "${backup_file}" 2>/dev/null || echo 0)
+                    
+                    if [ -z "$local_checksum" ]; then
+                        log "WARNING: Could not calculate checksum for local file, copying without checksum verification"
+                        log "Copying backup from local storage to S3..."
+                        if cp "${backup_file}" "${final_backup_file}"; then
+                            log "Successfully copied backup to S3"
+                            rm -f "${backup_file}"
+                            log "Removed local backup file"
+                            backup_file="${final_backup_file}"
+                            size=$(stat -c%s "${backup_file}" 2>/dev/null || echo 0)
+                        else
+                            log "WARNING: Failed to copy backup to S3, keeping local backup at ${backup_file}"
+                        fi
+                    else
+                        log "Copying backup from local storage to S3..."
+                        log "Local file checksum: ${local_checksum}, size: ${local_size} bytes"
+                        
+                        if cp "${backup_file}" "${final_backup_file}"; then
+                            # Post-copy verification
+                            local copied_size=$(stat -c%s "${final_backup_file}" 2>/dev/null || echo 0)
+                            local copied_checksum=$(calculate_file_checksum "${final_backup_file}")
+                            
+                            # Verify size matches
+                            if [ "$copied_size" -ne "$local_size" ]; then
+                                log "ERROR: File size mismatch after copy. Local: ${local_size} bytes, Copied: ${copied_size} bytes"
+                                log "ERROR: Copy verification failed, keeping local backup at ${backup_file}"
+                                rm -f "${final_backup_file}"
+                            elif [ -z "$copied_checksum" ]; then
+                                log "WARNING: Could not calculate checksum for copied file, but size matches. Copy appears successful."
+                                log "Successfully copied backup to S3 (size verified)"
+                                rm -f "${backup_file}"
+                                log "Removed local backup file"
+                                backup_file="${final_backup_file}"
+                                size=$copied_size
+                            elif [ "$copied_checksum" != "$local_checksum" ]; then
+                                log "ERROR: Checksum mismatch after copy. Local: ${local_checksum}, Copied: ${copied_checksum}"
+                                log "ERROR: Copy verification failed, keeping local backup at ${backup_file}"
+                                rm -f "${final_backup_file}"
+                            else
+                                log "Successfully copied backup to S3 (checksum verified: ${copied_checksum})"
+                                rm -f "${backup_file}"
+                                log "Removed local backup file"
+                                backup_file="${final_backup_file}"
+                                size=$copied_size
+                            fi
+                        else
+                            log "WARNING: Failed to copy backup to S3, keeping local backup at ${backup_file}"
+                        fi
+                    fi
                 fi
             fi
 
