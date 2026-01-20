@@ -311,6 +311,22 @@ backup_rabbitmq() {
     if is_s3fs_mount "${BACKUP_ROOT}"; then
         use_local_storage=true
         log "INFO: BACKUP_ROOT is on s3fs - will write to local storage first, then copy to S3"
+        
+        # Clean up old backup files (.tar.gz) older than 1 day in tmp directories
+        if [ -d "${local_backup_dir}" ]; then
+            if [ -d "${local_backup_dir}/daily" ]; then
+                local cleaned_count=$(find "${local_backup_dir}/daily" -name "*.tar.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                if [ "$cleaned_count" -gt 0 ]; then
+                    log "Cleaned up ${cleaned_count} old backup files from ${local_backup_dir}/daily"
+                fi
+            fi
+            if [ -d "${local_backup_dir}/weekly" ]; then
+                local cleaned_count=$(find "${local_backup_dir}/weekly" -name "*.tar.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                if [ "$cleaned_count" -gt 0 ]; then
+                    log "Cleaned up ${cleaned_count} old backup files from ${local_backup_dir}/weekly"
+                fi
+            fi
+        fi
     fi
 
     # Determine if weekly backup (Sunday = 7)
@@ -399,6 +415,22 @@ backup_loki() {
     if is_s3fs_mount "${BACKUP_ROOT}"; then
         use_local_storage=true
         log "INFO: BACKUP_ROOT is on s3fs - will write to local storage first, then copy to S3"
+        
+        # Clean up old backup files (.tar.gz) older than 1 day in tmp directories
+        if [ -d "${local_backup_dir}" ]; then
+            if [ -d "${local_backup_dir}/daily" ]; then
+                local cleaned_count=$(find "${local_backup_dir}/daily" -name "*.tar.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                if [ "$cleaned_count" -gt 0 ]; then
+                    log "Cleaned up ${cleaned_count} old backup files from ${local_backup_dir}/daily"
+                fi
+            fi
+            if [ -d "${local_backup_dir}/weekly" ]; then
+                local cleaned_count=$(find "${local_backup_dir}/weekly" -name "*.tar.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                if [ "$cleaned_count" -gt 0 ]; then
+                    log "Cleaned up ${cleaned_count} old backup files from ${local_backup_dir}/weekly"
+                fi
+            fi
+        fi
     fi
 
     if [ "$WEEKDAY" -eq 7 ]; then
@@ -475,6 +507,22 @@ backup_grafana() {
     if is_s3fs_mount "${BACKUP_ROOT}"; then
         use_local_storage=true
         log "INFO: BACKUP_ROOT is on s3fs - will write to local storage first, then copy to S3"
+        
+        # Clean up old backup files (.tar.gz) older than 1 day in tmp directories
+        if [ -d "${local_backup_dir}" ]; then
+            if [ -d "${local_backup_dir}/daily" ]; then
+                local cleaned_count=$(find "${local_backup_dir}/daily" -name "*.tar.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                if [ "$cleaned_count" -gt 0 ]; then
+                    log "Cleaned up ${cleaned_count} old backup files from ${local_backup_dir}/daily"
+                fi
+            fi
+            if [ -d "${local_backup_dir}/weekly" ]; then
+                local cleaned_count=$(find "${local_backup_dir}/weekly" -name "*.tar.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                if [ "$cleaned_count" -gt 0 ]; then
+                    log "Cleaned up ${cleaned_count} old backup files from ${local_backup_dir}/weekly"
+                fi
+            fi
+        fi
     fi
 
     if [ "$WEEKDAY" -eq 7 ]; then
@@ -632,6 +680,20 @@ backup_postgresql() {
     if [ -d "${local_backup_dir}" ]; then
         log "Cleaning up stale temp files from previous backups..."
         rm -f "${local_backup_dir}"/*.tmp "${local_backup_dir}"/*.sql.tmp "${local_backup_dir}"/*.stderr 2>/dev/null || true
+        
+        # Clean up old backup files (.sql.gz) older than 1 day in tmp directories
+        if [ -d "${local_backup_dir}/daily" ]; then
+            local cleaned_count=$(find "${local_backup_dir}/daily" -name "*.sql.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+            if [ "$cleaned_count" -gt 0 ]; then
+                log "Cleaned up ${cleaned_count} old backup files from ${local_backup_dir}/daily"
+            fi
+        fi
+        if [ -d "${local_backup_dir}/weekly" ]; then
+            local cleaned_count=$(find "${local_backup_dir}/weekly" -name "*.sql.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+            if [ "$cleaned_count" -gt 0 ]; then
+                log "Cleaned up ${cleaned_count} old backup files from ${local_backup_dir}/weekly"
+            fi
+        fi
     fi
     mkdir -p "${local_backup_dir}"
     
@@ -1113,6 +1175,42 @@ cleanup_old_backups() {
         if [ "$service" = "postgresql" ] && [ -d "${backup_dir}/errors" ]; then
             log "Cleaning ${service} error logs older than ${RETENTION_ERROR_LOGS} days..."
             find "${backup_dir}/errors" -name "*-error.log" -type f -mtime +${RETENTION_ERROR_LOGS} -delete 2>/dev/null || true
+        fi
+    done
+
+    # Clean up old backup files in /tmp/backups/ directories (for all services)
+    # These are temporary files that should have been deleted after copying to S3
+    # Clean up files older than 1 day to handle cases where copy failed or script was interrupted
+    log "Cleaning up old backup files in /tmp/backups/ directories..."
+    for service in rabbitmq loki grafana postgresql; do
+        local tmp_backup_dir="/tmp/backups/${service}"
+        
+        if [ -d "${tmp_backup_dir}" ]; then
+            # Clean daily backups older than 1 day
+            if [ -d "${tmp_backup_dir}/daily" ]; then
+                local cleaned_count=0
+                if [ "$service" = "postgresql" ]; then
+                    cleaned_count=$(find "${tmp_backup_dir}/daily" -name "*.sql.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                else
+                    cleaned_count=$(find "${tmp_backup_dir}/daily" -name "*.tar.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                fi
+                if [ "$cleaned_count" -gt 0 ]; then
+                    log "Cleaned up ${cleaned_count} old backup files from ${tmp_backup_dir}/daily"
+                fi
+            fi
+            
+            # Clean weekly backups older than 1 day
+            if [ -d "${tmp_backup_dir}/weekly" ]; then
+                local cleaned_count=0
+                if [ "$service" = "postgresql" ]; then
+                    cleaned_count=$(find "${tmp_backup_dir}/weekly" -name "*.sql.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                else
+                    cleaned_count=$(find "${tmp_backup_dir}/weekly" -name "*.tar.gz" -type f -mtime +1 -delete 2>/dev/null | wc -l || echo 0)
+                fi
+                if [ "$cleaned_count" -gt 0 ]; then
+                    log "Cleaned up ${cleaned_count} old backup files from ${tmp_backup_dir}/weekly"
+                fi
+            fi
         fi
     done
 
