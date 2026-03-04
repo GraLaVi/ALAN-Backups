@@ -20,6 +20,13 @@ RUN addgroup -g 1000 david && \
     adduser -u 1000 -G david -s /bin/bash -D david && \
     adduser david docker
 
+# Create crontab directory structure for user crontabs
+# dcron uses /var/spool/cron/crontabs/USERNAME for user crontabs
+RUN mkdir -p /var/spool/cron/crontabs && \
+    chmod 755 /var/spool/cron/crontabs && \
+    mkdir -p /home/david/logs && \
+    chown -R david:david /home/david
+
 # Default entrypoint will be overridden in docker-compose.yml
 # This ensures packages are available at runtime
 

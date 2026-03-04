@@ -61,12 +61,26 @@ services:
     # Setup and run cron (packages are pre-installed in Dockerfile)
     entrypoint: |
       sh -c "
-        chmod +x /usr/local/bin/backup.sh /usr/local/bin/notify.sh && \
+        # Check and create required directories with proper permissions
+        mkdir -p /var/spool/cron/crontabs && \
+        chmod 755 /var/spool/cron/crontabs && \
+        mkdir -p /home/david/logs && \
+        chmod 755 /home/david/logs && \
         mkdir -p /backups/rabbitmq/daily /backups/rabbitmq/weekly /backups/loki/daily /backups/loki/weekly /backups/grafana/daily /backups/grafana/weekly /backups/postgresql/daily /backups/postgresql/weekly && \
-        mkdir -p /status && \
-        echo \"$$BACKUP_SCHEDULE /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1\" > /etc/crontabs/root && \
+        mkdir -p /services/health_checks/status && \
+        mkdir -p /tmp/backups && \
+        # Check write permissions on critical directories
+        (touch /backups/.write_test 2>/dev/null && rm -f /backups/.write_test && echo '✓ /backups is writable') || echo 'WARNING: /backups may not be writable by UID 1000' && \
+        (touch /tmp/backups/.write_test 2>/dev/null && rm -f /tmp/backups/.write_test && echo '✓ /tmp/backups is writable') || echo 'WARNING: /tmp/backups may not be writable by UID 1000' && \
+        (touch /services/.write_test 2>/dev/null && rm -f /services/.write_test && echo '✓ /services is writable') || echo 'WARNING: /services may not be writable by UID 1000' && \
+        # Ensure scripts are executable
+        chmod +x /usr/local/bin/backup.sh /usr/local/bin/notify.sh && \
+        # Write cron job to user crontab
+        echo \"$$BACKUP_SCHEDULE /usr/local/bin/backup.sh >> /home/david/logs/backup.log 2>&1\" > /var/spool/cron/crontabs/david && \
+        chmod 600 /var/spool/cron/crontabs/david && \
         echo \"Backup service started. Schedule: $$BACKUP_SCHEDULE (no initial backup on restart)\" && \
-        crond -f -d 8
+        echo \"Running as user: \$(id -un) (UID: \$(id -u), GID: \$(id -g))\" && \
+        crond -f -d 8 -c /var/spool/cron/crontabs
       "
 
 volumes:
