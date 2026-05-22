@@ -797,8 +797,10 @@ backup_postgresql() {
         if [ "$db_size_bytes" != "0" ] && [ -n "$db_size_bytes" ]; then
             db_size_display=$(numfmt --to=iec ${db_size_bytes} 2>/dev/null || echo "${db_size_bytes} bytes")
             log "Database ${db_name} size: ${db_size_display}"
-            # Estimate backup size: 2x database size (conservative for compressed backup)
-            estimated_backup_size=$((db_size_bytes * 2))
+            # Estimate compressed backup size: ~50% of live DB size.
+            # pg_dump output streams directly through gzip, so no uncompressed intermediate.
+            # Real ratios for our DBs are ~5-10% — 50% leaves comfortable headroom.
+            estimated_backup_size=$((db_size_bytes / 2))
         else
             log "WARNING: Could not determine database size for ${db_name}, using default estimate"
             estimated_backup_size=1073741824  # Default 1GB estimate
@@ -860,72 +862,80 @@ backup_postgresql() {
         local pg_dump_exit_code=0
         
         log "Starting pg_dump for ${db_name} (timeout: ${BACKUP_TIMEOUT}s)..."
-        
-        # Run pg_dump first to a temporary uncompressed file to properly capture exit code
-        # Then gzip the result, so we can check pg_dump's exit code separately
-        local temp_sql_file="${target_dir}/${db_name}-${TIMESTAMP}.sql.tmp"
-        
-        # Run pg_dump with timeout, capturing both stdout and stderr separately
-        # Use a temp file for stderr to check for errors even if exit code is 0
-        local pg_dump_stderr="${temp_sql_file}.stderr"
-        set +o pipefail  # Disable pipefail temporarily
-        if ! PGPASSWORD="${POSTGRES_PASS}" run_with_timeout "${BACKUP_TIMEOUT}" pg_dump -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT:-5432}" -U "${POSTGRES_USER}" -d "${db_name}" > "${temp_sql_file}" 2>"${pg_dump_stderr}"; then
-            pg_dump_exit_code=$?
+
+        # Stream pg_dump directly through gzip into temp_file.
+        # No uncompressed intermediate file — required disk drops from ~2x DB size
+        # to roughly the final compressed size. Capture each stage's exit code via
+        # PIPESTATUS (pipefail is already enabled).
+        local pg_dump_stderr="${temp_file}.pgdump.stderr"
+        local gzip_stderr="${temp_file}.gzip.stderr"
+        local gzip_error=""
+        local gzip_exit_code=0
+
+        if command -v timeout >/dev/null 2>&1; then
+            PGPASSWORD="${POSTGRES_PASS}" timeout "${BACKUP_TIMEOUT}" \
+                pg_dump -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT:-5432}" -U "${POSTGRES_USER}" -d "${db_name}" \
+                2>"${pg_dump_stderr}" \
+                | gzip > "${temp_file}" 2>"${gzip_stderr}"
         else
-            pg_dump_exit_code=0
+            log "WARNING: timeout command not available, running pg_dump without timeout"
+            PGPASSWORD="${POSTGRES_PASS}" \
+                pg_dump -h "${POSTGRES_HOST}" -p "${POSTGRES_PORT:-5432}" -U "${POSTGRES_USER}" -d "${db_name}" \
+                2>"${pg_dump_stderr}" \
+                | gzip > "${temp_file}" 2>"${gzip_stderr}"
         fi
-        set -o pipefail  # Re-enable pipefail
-        
-        # Check if there are errors in stderr (even if exit code is 0)
+        pg_dump_exit_code=${PIPESTATUS[0]}
+        gzip_exit_code=${PIPESTATUS[1]}
+
+        # Surface pg_dump stderr — it sometimes contains warnings even on a clean exit
         if [ -s "${pg_dump_stderr}" ]; then
             cat "${pg_dump_stderr}" >> "${error_log}"
-            # If stderr has content, it might indicate a problem
             local stderr_content=$(cat "${pg_dump_stderr}")
             if echo "$stderr_content" | grep -qi "error\|failed\|fatal"; then
-                pg_dump_exit_code=1
+                if [ $pg_dump_exit_code -eq 0 ]; then
+                    pg_dump_exit_code=1
+                fi
                 log "WARNING: pg_dump produced error messages in stderr"
             fi
         fi
         rm -f "${pg_dump_stderr}"
-        
-        # Check if temp_sql_file exists and has content
-        if [ ! -f "${temp_sql_file}" ]; then
-            log "ERROR: pg_dump did not create output file"
-            pg_dump_exit_code=1
-        elif [ ! -s "${temp_sql_file}" ]; then
-            log "ERROR: pg_dump output file is empty"
-            pg_dump_exit_code=1
-            # Show error log content for debugging
+
+        # Capture gzip failure context if the compress stage died
+        if [ $gzip_exit_code -ne 0 ]; then
+            gzip_error=$(cat "${gzip_stderr}" 2>/dev/null || echo "gzip compression failed (exit ${gzip_exit_code})")
+            echo "gzip error:" >> "${error_log}"
+            cat "${gzip_stderr}" >> "${error_log}" 2>/dev/null || true
+            if [ $pg_dump_exit_code -eq 0 ]; then
+                pg_dump_exit_code=1
+            fi
+            log "ERROR: Failed to compress backup file"
+            log "gzip error: ${gzip_error}"
+        fi
+        rm -f "${gzip_stderr}"
+
+        # Validate the resulting compressed file
+        if [ ! -f "${temp_file}" ]; then
+            log "ERROR: pg_dump | gzip did not create output file"
+            if [ $pg_dump_exit_code -eq 0 ]; then
+                pg_dump_exit_code=1
+            fi
+        elif [ ! -s "${temp_file}" ]; then
+            log "ERROR: output file is empty"
+            if [ $pg_dump_exit_code -eq 0 ]; then
+                pg_dump_exit_code=1
+            fi
             if [ -s "${error_log}" ]; then
                 log "pg_dump error output: $(head -20 "${error_log}")"
             fi
+            rm -f "${temp_file}"
         else
-            local temp_file_size=$(stat -c%s "${temp_sql_file}" 2>/dev/null || echo 0)
-            log "pg_dump completed: ${temp_file_size} bytes written to temp file"
+            local temp_file_size=$(stat -c%s "${temp_file}" 2>/dev/null || echo 0)
+            log "pg_dump | gzip completed: ${temp_file_size} bytes written to ${temp_file}"
         fi
-        
-        # If pg_dump succeeded and file has content, compress the output
-        local gzip_error=""
-        if [ $pg_dump_exit_code -eq 0 ] && [ -s "${temp_sql_file}" ]; then
-            # Capture gzip stderr separately to include in error details
-            local gzip_stderr="${temp_sql_file}.gzip.stderr"
-            if ! gzip -c "${temp_sql_file}" > "${temp_file}" 2>"${gzip_stderr}"; then
-                pg_dump_exit_code=1
-                gzip_error=$(cat "${gzip_stderr}" 2>/dev/null || echo "gzip compression failed")
-                # Append gzip error to error log
-                echo "gzip error:" >> "${error_log}"
-                cat "${gzip_stderr}" >> "${error_log}" 2>/dev/null || true
-                log "ERROR: Failed to compress backup file"
-                log "gzip error: ${gzip_error}"
-                # Clean up temp files on compression failure
-                rm -f "${temp_file}" "${temp_sql_file}" "${gzip_stderr}"
-            else
-                # Compression succeeded, clean up temp files
-                rm -f "${gzip_stderr}" "${temp_sql_file}"
-            fi
-        else
-            # pg_dump failed or file is empty, clean up temp files
-            rm -f "${temp_sql_file}"
+
+        # If any stage failed, discard the partial compressed file
+        if [ $pg_dump_exit_code -ne 0 ]; then
+            rm -f "${temp_file}"
         fi
         
         # Signal progress monitor to stop
@@ -988,18 +998,10 @@ backup_postgresql() {
                 # Include compression-specific details if compression failed
                 if [ "$error_category" = "compression" ] && [ -n "$gzip_error" ]; then
                     echo "Compression failure details:"
-                    # Try to get uncompressed file size (file may have been cleaned up)
-                    if [ -f "${temp_sql_file}" ]; then
-                        local uncompressed_size=$(stat -c%s "${temp_sql_file}" 2>/dev/null || echo "unknown")
-                        echo "  Uncompressed file size: ${uncompressed_size} bytes"
-                        # Try to get available disk space
-                        local temp_dir=$(dirname "${temp_file}")
-                        if command -v df >/dev/null 2>&1; then
-                            local available_space=$(df -B1 "$temp_dir" 2>/dev/null | tail -n 1 | awk '{print $4}' || echo "unknown")
-                            echo "  Available space in temp directory: ${available_space} bytes"
-                        fi
-                    else
-                        echo "  Uncompressed file size: unknown (file already cleaned up)"
+                    local temp_dir=$(dirname "${temp_file}")
+                    if command -v df >/dev/null 2>&1; then
+                        local available_space=$(df -B1 "$temp_dir" 2>/dev/null | tail -n 1 | awk '{print $4}' || echo "unknown")
+                        echo "  Available space in temp directory: ${available_space} bytes"
                     fi
                     echo "  gzip error: ${gzip_error}"
                 fi
@@ -1013,7 +1015,7 @@ backup_postgresql() {
             local db_duration=$((db_end_time - db_start_time))
 
             # Clean up all temp files (may have already been cleaned up, but ensure they're gone)
-            rm -f "${temp_file}" "${temp_sql_file}" "${temp_file}.complete" "${temp_sql_file}.gzip.stderr" "${temp_sql_file}.stderr"
+            rm -f "${temp_file}" "${temp_file}.complete" "${temp_file}.pgdump.stderr" "${temp_file}.gzip.stderr"
 
             # Write failure status for this database
             update_postgresql_db_status "${db_name}" "failed" "Backup failed (${error_category})" 0 "${db_duration}" "none" "${error_msg}"

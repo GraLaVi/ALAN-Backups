@@ -77,7 +77,9 @@ EOF
         # Send API request
         local response
         local http_code
-        response=$(curl -s -w "\n%{http_code}" -X POST "${api_url}" \
+        response=$(curl -s -w "\n%{http_code}" \
+            --connect-timeout 10 --max-time 30 \
+            -X POST "${api_url}" \
             -H "Content-Type: application/json" \
             -d "${payload}" 2>&1)
 
