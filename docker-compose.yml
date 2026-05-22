@@ -40,11 +40,11 @@ services:
       - BACKUP_SCHEDULE=0 3 * * *  # 3 AM PST/PDT daily
       - RETENTION_DAILY=7
       - RETENTION_WEEKLY=4
-      - TZ=America/Los_Angeles
+      - TZ=America/New_York
 
       # Environment and notification configuration
       - APP_ENV=${APP_ENV:-development}
-      - NOTIFICATION_EMAIL=${NOTIFICATION_EMAIL:-admin@gphusa.com}
+      # - NOTIFICATION_EMAIL=${NOTIFICATION_EMAIL:-admin@gphusa.com}
 
       # RabbitMQ API access for definitions backup
       - RABBITMQ_HOST=rabbitmq
