@@ -4,6 +4,13 @@ services:
       context: .
     container_name: alan_backup_service
     restart: unless-stopped
+
+    # Cap CPU so nightly compression (gzip/tar/pg_dump) cannot trip HighCPU alerts.
+    # 1.5 cores on a 4-core host (~38% max). Matches the real peak: one single-threaded
+    # gzip plus its producer (pg_dump/tar). Backups run sequentially, so this only
+    # makes the 3 AM run marginally longer.
+    cpus: 1.5
+
     volumes:
       # Backup storage location
       - /mnt/shared/alan/backups:/backups
@@ -72,7 +79,7 @@ services:
         # Ensure scripts are executable
         chmod +x /usr/local/bin/backup.sh /usr/local/bin/notify.sh && \
         # Write cron job to user crontab
-        echo \"$$BACKUP_SCHEDULE /usr/local/bin/backup.sh >> /home/david/logs/backup.log 2>&1\" > /var/spool/cron/crontabs/david && \
+        echo \"$$BACKUP_SCHEDULE nice -n 19 ionice -c3 /usr/local/bin/backup.sh >> /home/david/logs/backup.log 2>&1\" > /var/spool/cron/crontabs/david && \
         chmod 600 /var/spool/cron/crontabs/david && \
         echo \"Backup service started. Schedule: $$BACKUP_SCHEDULE (no initial backup on restart)\" && \
         echo \"Running as user: \$(id -un) (UID: \$(id -u), GID: \$(id -g))\" && \
