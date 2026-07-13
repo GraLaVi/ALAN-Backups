@@ -214,6 +214,21 @@ generate_email_body() {
         pg_rows="  (no PostgreSQL status files found)"$'\n'
     fi
 
+    # --- Archive (cold storage) ---
+    local arch_file="${STATUS_ROOT}/archive_last_run.json"
+    local arch_status=$(read_status_field "$arch_file" ".status" "unknown")
+    local arch_message=$(read_status_field "$arch_file" ".message" "")
+    local arch_root=$(read_status_field "$arch_file" ".archive_root" "/backup_archives")
+    local arch_moved=$(read_status_field "$arch_file" ".files_moved" "0")
+    local arch_bytes=$(read_status_field "$arch_file" ".bytes_moved" "0")
+    local arch_pruned=$(read_status_field "$arch_file" ".files_pruned" "0")
+    local arch_bytes_human=$(numfmt --to=iec ${arch_bytes} 2>/dev/null || echo "${arch_bytes} bytes")
+
+    local archive_warning=""
+    if [ "$arch_status" != "success" ] && [ "$arch_status" != "unknown" ]; then
+        archive_warning="WARNING: $(truncate_str "$arch_message" 700)"$'\n'
+    fi
+
     # --- Failures section (only when something failed) ---
     local failures_section=""
     if [ -n "$failures" ]; then
@@ -239,14 +254,23 @@ Loki:     ${loki_status} (${loki_size_human}, ${loki_duration}s)
 Grafana:  ${grafana_status} (${grafana_size_human}, ${grafana_duration}s)
 PostgreSQL:
 ${pg_rows}
+Archive (cold storage):
+-----------------------
+Status: ${arch_status}
+Moved:  ${arch_moved} file(s) (${arch_bytes_human}) -> ${arch_root}
+Pruned: ${arch_pruned} archived file(s) past retention
+${archive_warning}
 Backup Location:
 ----------------
-/mnt/shared/alan/backups/
+Primary: /mnt/shared/alan/backups/
+Archive: /mnt/shared/object_storage/backup_archives/
 
 Retention Policy:
 -----------------
-Daily backups: 7 days
-Weekly backups: 4 weeks
+Primary keeps newest ${KEEP_DAILY:-1} daily + ${KEEP_WEEKLY:-2} weekly per backup set
+Older backups are moved (verified copy) to the archive
+Archived backups purged after ${ARCHIVE_RETENTION_DAYS:-180} days
+PostgreSQL error logs: 30 days
 
 Next Scheduled Backup:
 ---------------------
@@ -296,6 +320,12 @@ main() {
         subject="ALAN Systems Backup: Warning - ${FAILED_COUNT} service(s) failed"
     fi
     
+    # Surface archive problems in the subject without turning the run red
+    local arch_status=$(jq -r '.status // "unknown"' "${STATUS_ROOT}/archive_last_run.json" 2>/dev/null || echo "unknown")
+    if [ ${FAILED_COUNT} -eq 0 ] && [ "$arch_status" != "success" ] && [ "$arch_status" != "unknown" ]; then
+        subject="${subject} (archive warning)"
+    fi
+
     # Add environment label to subject for dev environment only
     if [ "${APP_ENV}" = "development" ]; then
         subject="${subject} (DEV)"

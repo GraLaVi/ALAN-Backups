@@ -5,15 +5,28 @@ services:
     container_name: alan_backup_service
     restart: unless-stopped
 
-    # Cap CPU so nightly compression (gzip/tar/pg_dump) cannot trip HighCPU alerts.
-    # 1.5 cores on a 4-core host (~38% max). Matches the real peak: one single-threaded
-    # gzip plus its producer (pg_dump/tar). Backups run sequentially, so this only
-    # makes the 3 AM run marginally longer.
+    # Cap at 1.5 cores so the nightly compression (gzip/tar/pg_dump client)
+    # can never starve the containers sharing this host (grafana, celery beat,
+    # rabbitmq). This is a starvation guard, NOT an alert fix: the
+    # ContainerHighCpu alert measures CPU normalized by host cores (see
+    # ALAN-Loki prometheus/rules/containers.yml), so 1.5 cores registers well
+    # under its 80%-of-host threshold on any host with >= 2 cores. Backups run
+    # sequentially (one gzip + its producer), so 1.5 matches the real peak.
     cpus: 1.5
 
     volumes:
       # Backup storage location
       - /mnt/shared/alan/backups:/backups
+
+      # Cold-storage archive: old backups are moved here (cheaper/slower disk
+      # will be mounted at /mnt/shared/object_storage). rslave propagation so
+      # the container sees the disk if it is mounted on the host after
+      # container start (default rprivate would keep showing the old dir).
+      - type: bind
+        source: /mnt/shared/object_storage/backup_archives
+        target: /backup_archives
+        bind:
+          propagation: rslave
 
       # Local temporary storage for large backups (used when BACKUP_ROOT is on s3fs)
       # Files are written here first, then copied to S3 and deleted
@@ -41,8 +54,10 @@ services:
     environment:
       # Backup configuration
       - BACKUP_SCHEDULE=0 3 * * *  # 3 AM PST/PDT daily
-      - RETENTION_DAILY=7
-      - RETENTION_WEEKLY=4
+      - KEEP_DAILY=1               # newest N dailies kept in primary per backup set
+      - KEEP_WEEKLY=2              # newest N weeklies kept in primary per backup set
+      - ARCHIVE_ROOT=/backup_archives
+      - ARCHIVE_RETENTION_DAYS=180 # purge archived backups after 6 months
       - TZ=America/New_York
 
       # Environment and notification configuration
@@ -76,6 +91,7 @@ services:
         (touch /backups/.write_test 2>/dev/null && rm -f /backups/.write_test && echo '✓ /backups is writable') || echo 'WARNING: /backups may not be writable by UID 1000' && \
         (touch /tmp/backups/.write_test 2>/dev/null && rm -f /tmp/backups/.write_test && echo '✓ /tmp/backups is writable') || echo 'WARNING: /tmp/backups may not be writable by UID 1000' && \
         (touch /services/.write_test 2>/dev/null && rm -f /services/.write_test && echo '✓ /services is writable') || echo 'WARNING: /services may not be writable by UID 1000' && \
+        (touch /backup_archives/.write_test 2>/dev/null && rm -f /backup_archives/.write_test && echo '✓ /backup_archives is writable') || echo 'WARNING: /backup_archives not writable — archival will be skipped' && \
         # Ensure scripts are executable
         chmod +x /usr/local/bin/backup.sh /usr/local/bin/notify.sh && \
         # Write cron job to user crontab

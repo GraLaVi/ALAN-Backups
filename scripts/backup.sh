@@ -15,9 +15,23 @@ DATE=$(date +%Y-%m-%d)
 WEEKDAY=$(date +%u)  # 1=Monday, 7=Sunday
 
 # Retention settings
-RETENTION_DAILY=${RETENTION_DAILY:-7}
-RETENTION_WEEKLY=${RETENTION_WEEKLY:-4}
+# Primary keeps only the newest backups; everything older is MOVED (verified
+# copy) to the cold-storage archive at ARCHIVE_ROOT instead of deleted.
+KEEP_DAILY=${KEEP_DAILY:-1}        # newest N files kept in each daily/ per prefix
+KEEP_WEEKLY=${KEEP_WEEKLY:-2}      # newest N files kept in each weekly/ per prefix
 RETENTION_ERROR_LOGS=${RETENTION_ERROR_LOGS:-30}  # Keep error logs for 30 days
+
+# Archival settings (cold storage; host: /mnt/shared/object_storage/backup_archives)
+ARCHIVE_ROOT=${ARCHIVE_ROOT:-/backup_archives}
+ARCHIVE_RETENTION_DAYS=${ARCHIVE_RETENTION_DAYS:-180}  # purge archived files older than this
+
+# Archive run counters (read by generate_summary / write_archive_status)
+ARCHIVE_STATUS="success"        # success | skipped | partial_failure
+ARCHIVE_SKIP_REASON=""
+ARCHIVE_FILES_MOVED=0
+ARCHIVE_BYTES_MOVED=0
+ARCHIVE_FILES_FAILED=0
+ARCHIVE_FILES_PRUNED=0
 
 # Timeout settings
 BACKUP_TIMEOUT=${BACKUP_TIMEOUT:-7200}  # Default 2 hours for large databases
@@ -1154,25 +1168,207 @@ backup_postgresql() {
     fi
 }
 
-# Cleanup old backups
+# Check the archive target is usable; sets ARCHIVE_SKIP_REASON when not
+archive_target_ok() {
+    if [ ! -d "${ARCHIVE_ROOT}" ]; then
+        ARCHIVE_SKIP_REASON="archive root ${ARCHIVE_ROOT} does not exist"
+        return 1
+    fi
+    if ! (touch "${ARCHIVE_ROOT}/.write_test" 2>/dev/null && rm -f "${ARCHIVE_ROOT}/.write_test"); then
+        ARCHIVE_SKIP_REASON="archive root ${ARCHIVE_ROOT} is not writable"
+        return 1
+    fi
+    return 0
+}
+
+# Move one file to the archive: copy + verify + remove source.
+# NEVER deletes the source unless the archive copy verified. Uses explicit
+# cp+verify+rm rather than mv: across the bind-mount boundary mv degrades to
+# an unverified copy+unlink (EXDEV).
+archive_one_file() {
+    local src=$1
+    local dst_dir=$2
+    local fname=$(basename "$src")
+    local dst="${dst_dir}/${fname}"
+    local partial="${dst}.partial"
+    local src_size=$(stat -c%s "$src" 2>/dev/null || echo 0)
+
+    if ! mkdir -p "$dst_dir" 2>/dev/null; then
+        log "WARNING: Cannot create archive dir ${dst_dir}, skipping ${fname}"
+        return 1
+    fi
+
+    # Idempotency: already archived with identical content -> just drop the primary copy
+    if [ -f "$dst" ]; then
+        local dst_size=$(stat -c%s "$dst" 2>/dev/null || echo 0)
+        if [ "$dst_size" -eq "$src_size" ] && \
+           [ "$(calculate_file_checksum "$dst")" = "$(calculate_file_checksum "$src")" ]; then
+            rm -f "$src"
+            return 0
+        fi
+        log "WARNING: ${dst} exists with different content; leaving ${fname} in primary"
+        return 1
+    fi
+
+    # Best-effort space check on the archive filesystem
+    if ! check_disk_space "$src_size" "${ARCHIVE_ROOT}/space_probe"; then
+        log "WARNING: Insufficient space on archive for ${fname}, leaving in primary"
+        return 1
+    fi
+
+    # cp -p preserves mtime so the ARCHIVE_RETENTION_DAYS prune ages files
+    # from when the backup was taken, not when it was archived.
+    if ! cp -p "$src" "$partial" 2>/dev/null; then
+        log "WARNING: Copy to archive failed for ${fname}"
+        rm -f "$partial" 2>/dev/null || true
+        return 1
+    fi
+
+    local copied_size=$(stat -c%s "$partial" 2>/dev/null || echo 0)
+    if [ "$copied_size" -ne "$src_size" ] || \
+       [ "$(calculate_file_checksum "$partial")" != "$(calculate_file_checksum "$src")" ]; then
+        log "ERROR: Verification failed after copying ${fname} to archive; keeping primary copy"
+        rm -f "$partial" 2>/dev/null || true
+        return 1
+    fi
+    case "$fname" in
+        *.gz)
+            if ! verify_gzip_file "$partial"; then
+                rm -f "$partial" 2>/dev/null || true
+                return 1
+            fi
+            ;;
+    esac
+
+    if ! mv "$partial" "$dst" 2>/dev/null; then
+        log "WARNING: Could not finalize archive copy of ${fname}"
+        rm -f "$partial" 2>/dev/null || true
+        return 1
+    fi
+    rm -f "$src"
+    ARCHIVE_FILES_MOVED=$((ARCHIVE_FILES_MOVED + 1))
+    ARCHIVE_BYTES_MOVED=$((ARCHIVE_BYTES_MOVED + src_size))
+    log "Archived: ${fname} -> ${dst_dir}"
+    return 0
+}
+
+# Purge archived files older than ARCHIVE_RETENTION_DAYS (mtime-based; cp -p
+# preserved the original backup mtime). Also clears stale .partial files.
+prune_archive() {
+    local before=$(find "${ARCHIVE_ROOT}" -type f \
+        \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
+        -mtime +${ARCHIVE_RETENTION_DAYS} 2>/dev/null | wc -l || echo 0)
+    find "${ARCHIVE_ROOT}" -type f \
+        \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
+        -mtime +${ARCHIVE_RETENTION_DAYS} -delete 2>/dev/null || true
+    find "${ARCHIVE_ROOT}" -type f -name '*.partial' -mtime +2 -delete 2>/dev/null || true
+    ARCHIVE_FILES_PRUNED=${before}
+    if [ "${ARCHIVE_FILES_PRUNED}" -gt 0 ]; then
+        log "Pruned ${ARCHIVE_FILES_PRUNED} archived file(s) older than ${ARCHIVE_RETENTION_DAYS} days"
+    fi
+}
+
+# Write archive status JSON for API / notification integration
+write_archive_status() {
+    local message="Archived ${ARCHIVE_FILES_MOVED} file(s)"
+    if [ -n "${ARCHIVE_SKIP_REASON}" ]; then
+        message="${ARCHIVE_SKIP_REASON}"
+    elif [ "${ARCHIVE_FILES_FAILED}" -gt 0 ]; then
+        message="Archived ${ARCHIVE_FILES_MOVED} file(s); ${ARCHIVE_FILES_FAILED} failed verification and stayed in primary"
+    fi
+
+    cat > "${STATUS_ROOT}/archive_last_run.json" <<EOF
+{
+  "service": "archive",
+  "status": "$(escape_json_string "${ARCHIVE_STATUS}")",
+  "message": "$(escape_json_string "${message}")",
+  "timestamp": "$(date -Iseconds)",
+  "archive_root": "${ARCHIVE_ROOT}",
+  "files_moved": ${ARCHIVE_FILES_MOVED},
+  "bytes_moved": ${ARCHIVE_BYTES_MOVED},
+  "files_failed": ${ARCHIVE_FILES_FAILED},
+  "files_pruned": ${ARCHIVE_FILES_PRUNED}
+}
+EOF
+}
+
+# Archive old backups to cold storage. Keeps the newest KEEP_DAILY files in
+# each daily/ and KEEP_WEEKLY in each weekly/ per file prefix (per database
+# for postgresql); moves everything older to ARCHIVE_ROOT mirroring the
+# {service}/{daily,weekly} layout. Never fails the backup run.
+archive_old_backups() {
+    log "Archiving old backups to ${ARCHIVE_ROOT}..."
+
+    if ! archive_target_ok; then
+        ARCHIVE_STATUS="skipped"
+        log "WARNING: Archival skipped: ${ARCHIVE_SKIP_REASON}"
+        write_archive_status
+        return 0
+    fi
+
+    local service tier keep src_dir dst_dir groups group_line prefix ext old_files f
+    for service in rabbitmq loki grafana postgresql; do
+        for tier in daily weekly; do
+            if [ "$tier" = "daily" ]; then
+                keep=${KEEP_DAILY}
+            else
+                keep=${KEEP_WEEKLY}
+            fi
+            src_dir="${BACKUP_ROOT}/${service}/${tier}"
+            dst_dir="${ARCHIVE_ROOT}/${service}/${tier}"
+            [ -d "$src_dir" ] || continue
+
+            # Distinct "prefix|ext" groups, e.g. "alandb|.sql.gz",
+            # "backup|.tar.gz", "definitions|.json". The timestamp pattern is
+            # anchored to the extension so prefixes containing '-' survive;
+            # '|' cannot appear in these filenames.
+            groups=$(find "$src_dir" -maxdepth 1 -type f \
+                    \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) 2>/dev/null \
+                | sed -E 's|.*/||; s/^(.+)-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}(\.(sql\.gz|tar\.gz|json))$/\1|\2/' \
+                | grep -F '|' | sort -u || true)
+            [ -n "$groups" ] || continue
+
+            while IFS='|' read -r prefix ext; do
+                [ -n "$prefix" ] || continue
+                # Newest-first by filename (timestamps sort lexicographically =
+                # chronologically; more reliable than mtime). Skip newest $keep.
+                # Iterate in the current shell so the counters survive; the
+                # filenames never contain whitespace.
+                old_files=$(find "$src_dir" -maxdepth 1 -type f \
+                        -name "${prefix}-????-??-??T??-??-??${ext}" 2>/dev/null \
+                    | sort -r | tail -n +$((keep + 1)) || true)
+                [ -n "$old_files" ] || continue
+                for f in $old_files; do
+                    if ! archive_one_file "$f" "$dst_dir"; then
+                        ARCHIVE_FILES_FAILED=$((ARCHIVE_FILES_FAILED + 1))
+                    fi
+                done
+            done <<EOF
+$groups
+EOF
+        done
+    done
+
+    prune_archive
+
+    if [ "${ARCHIVE_FILES_FAILED}" -gt 0 ]; then
+        ARCHIVE_STATUS="partial_failure"
+    fi
+    write_archive_status
+    log "Archival done: moved=${ARCHIVE_FILES_MOVED} failed=${ARCHIVE_FILES_FAILED} pruned=${ARCHIVE_FILES_PRUNED}"
+    return 0
+}
+
+# Cleanup error logs and temporary files (old daily/weekly deletion replaced
+# by archive_old_backups above)
 cleanup_old_backups() {
     log "Cleaning up old backups..."
 
+    # Old daily/weekly backups are no longer deleted here — archive_old_backups
+    # moves them to cold storage (ARCHIVE_ROOT) with the keep-newest policy.
     for service in rabbitmq loki grafana postgresql; do
         local backup_dir="${BACKUP_ROOT}/${service}"
 
-        # Clean daily backups older than RETENTION_DAILY days
-        log "Cleaning ${service} daily backups older than ${RETENTION_DAILY} days..."
-        find "${backup_dir}/daily" -name "*.tar.gz" -type f -mtime +${RETENTION_DAILY} -delete 2>/dev/null || true
-        find "${backup_dir}/daily" -name "*.sql.gz" -type f -mtime +${RETENTION_DAILY} -delete 2>/dev/null || true
-        find "${backup_dir}/daily" -name "*.json" -type f -mtime +${RETENTION_DAILY} -delete 2>/dev/null || true
-
-        # Keep only RETENTION_WEEKLY most recent weekly backups
-        log "Cleaning ${service} weekly backups, keeping ${RETENTION_WEEKLY} most recent..."
-        ls -t "${backup_dir}/weekly/"*.tar.gz 2>/dev/null | tail -n +$((RETENTION_WEEKLY + 1)) | xargs rm -f 2>/dev/null || true
-        ls -t "${backup_dir}/weekly/"*.sql.gz 2>/dev/null | tail -n +$((RETENTION_WEEKLY + 1)) | xargs rm -f 2>/dev/null || true
-        ls -t "${backup_dir}/weekly/"*.json 2>/dev/null | tail -n +$((RETENTION_WEEKLY + 1)) | xargs rm -f 2>/dev/null || true
-        
         # Clean error logs older than RETENTION_ERROR_LOGS days (only for postgresql)
         if [ "$service" = "postgresql" ] && [ -d "${backup_dir}/errors" ]; then
             log "Cleaning ${service} error logs older than ${RETENTION_ERROR_LOGS} days..."
@@ -1289,9 +1485,11 @@ generate_summary() {
     }
   },
   "retention_policy": {
-    "daily": ${RETENTION_DAILY},
-    "weekly": ${RETENTION_WEEKLY}
+    "primary_keep_daily": ${KEEP_DAILY},
+    "primary_keep_weekly": ${KEEP_WEEKLY},
+    "archive_retention_days": ${ARCHIVE_RETENTION_DAYS}
   },
+  "archive": $(cat "${STATUS_ROOT}/archive_last_run.json" 2>/dev/null || echo '{"status": "unknown"}'),
   "next_scheduled_backup": "$(calculate_next_backup_time)"
 }
 EOF
@@ -1318,7 +1516,10 @@ main() {
     backup_grafana || failed=$((failed + 1))
     backup_postgresql || failed=$((failed + 1))
 
-    # Cleanup old backups
+    # Archive older backups to cold storage (never fails the run)
+    archive_old_backups
+
+    # Cleanup error logs and temporary files
     cleanup_old_backups
 
     # Generate summary

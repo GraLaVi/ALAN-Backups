@@ -30,7 +30,8 @@ ALAN-Backups/
 ```
 
 Host paths:
-- Backups: `/mnt/shared/alan/backups/{rabbitmq,loki,grafana,postgresql}/{daily,weekly}/`
+- Backups (primary): `/mnt/shared/alan/backups/{rabbitmq,loki,grafana,postgresql}/{daily,weekly}/`
+- Backups (cold-storage archive): `/mnt/shared/object_storage/backup_archives/{service}/{daily,weekly}/` — older backups are moved here automatically
 - Status JSON: `/mnt/shared/alan/services/health_checks/status/`
 - In-container log: `/home/david/logs/backup.log`
 
@@ -59,8 +60,27 @@ Container name: `alan_backup_service`. Service name (for `docker compose`): `bac
 ## Schedule
 
 - Default: `BACKUP_SCHEDULE="0 3 * * *"` — 3:00 AM **America/New_York** (`TZ` is set in compose).
-- Daily retention: 7 days. Weekly retention: 4 weeks (Sundays).
 - To change: edit `BACKUP_SCHEDULE` in `docker-compose.yml`, then `./start_app.sh --up` (recreates the container so cron picks up the new schedule).
+
+## Retention & archival
+
+After every run, old backups are **moved** (verified copy: size + md5, `gzip -t`
+for dumps) to the cold-storage archive instead of being deleted:
+
+- Primary (`/mnt/shared/alan/backups`) keeps the newest **`KEEP_DAILY=1`** file
+  in each `daily/` and the newest **`KEEP_WEEKLY=2`** in each `weekly/`, per
+  file prefix (per database for postgresql; `backup-*`/`definitions-*` for the
+  volume backups). Everything older moves to
+  `/mnt/shared/object_storage/backup_archives/{service}/{daily,weekly}/`.
+- Archive: files older than **`ARCHIVE_RETENTION_DAYS=180`** days (by original
+  backup mtime — `cp -p` preserves it) are deleted from the archive.
+- `postgresql/errors/` logs: still deleted after 30 days (not archived).
+- A file is never removed from the primary unless its archive copy verified.
+  If the archive dir is missing/unwritable, archival is **skipped** (files stay
+  put), the run still succeeds, and the notification email carries a warning.
+- The archive path is intended to be a cheaper/slower disk mounted at
+  `/mnt/shared/object_storage`; the bind mount uses `rslave` propagation so the
+  container picks the mount up even if it appears after container start.
 
 ## Manually running a backup
 
@@ -116,13 +136,19 @@ The restore flow:
 **Restoring PostgreSQL manually** (host shell, not the backup container):
 
 ```bash
-# Find the dump you want
-ls /mnt/shared/alan/backups/postgresql/daily/
+# Find the dump you want — recent ones in the primary, older ones in the archive
+ls /mnt/shared/alan/backups/postgresql/{daily,weekly}/
+ls /mnt/shared/object_storage/backup_archives/postgresql/{daily,weekly}/
 
 # Restore (example for alandb — adjust user/host as needed)
 gunzip -c /mnt/shared/alan/backups/postgresql/daily/alandb-2026-05-21T03-00-00.sql.gz \
   | psql -h <postgres_host> -U <user> -d alandb
 ```
+
+**Restoring an archived (older) backup**: `restore.sh` only sees `/backups`
+(the primary). For rabbitmq/loki/grafana, either pass the archived file by
+copying it back into the primary tree first, or restore manually. For
+PostgreSQL just point `gunzip -c` at the archive path directly (example above).
 
 ## Notification configuration
 
@@ -142,20 +168,23 @@ The email body (rewritten in `notify.sh`) now includes:
 1. **Header** — `Status`, `Timestamp`, `Duration`, `Failed Services: N/M` (computed from the actual status files, including each PostgreSQL DB).
 2. **Failures** — only present when something failed. Lists every failed item with its `message` and (for PostgreSQL) `error_detail`. Each field is truncated to **700 chars** with a `…(truncated)` marker so a long `pg_dump` stderr doesn't blow up the email.
 3. **Service Status** — per-service line for RabbitMQ / Loki / Grafana with size + duration, plus a **PostgreSQL** subsection with one row per database.
-4. **Backup location, retention, next scheduled** — footer info.
+4. **Archive (cold storage)** — status, files/bytes moved, files pruned; a `WARNING:` line when archival was skipped or files failed verification.
+5. **Backup location, retention, next scheduled** — footer info.
 
 Subject line:
 - Success: `ALAN Systems Backup: Success`
 - Partial failure: `ALAN Systems Backup: Warning - N service(s) failed`
+- All backups fine but archival skipped/partial: ` (archive warning)` is appended.
 - In dev, ` (DEV)` is appended.
 
 ## Status files (dashboard integration)
 
 All written to `/mnt/shared/alan/services/health_checks/status/`:
 
-- `backup_summary.json` — overall rollup (rabbitmq, loki, grafana, postgresql.overall_status, postgresql.databases map, retention policy, next scheduled run).
+- `backup_summary.json` — overall rollup (rabbitmq, loki, grafana, postgresql.overall_status, postgresql.databases map, retention policy, embedded `archive` block, next scheduled run).
 - `rabbitmq_last_backup.json`, `loki_last_backup.json`, `grafana_last_backup.json` — per-service: `status`, `message`, `timestamp`, `backup_date`, `backup_file`, `size_bytes`, `duration_seconds`.
 - `postgresql_<dbname>_last_backup.json` — one per DB. Same fields plus `database` and (on failure) `error_detail` containing the `pg_dump` stderr.
+- `archive_last_run.json` — archival result: `status` (`success`/`skipped`/`partial_failure`), `message`, `archive_root`, `files_moved`, `bytes_moved`, `files_failed`, `files_pruned`.
 - `webhook_payload.json` — last webhook payload for the dashboard.
 
 Quick checks:
@@ -173,11 +202,30 @@ docker exec alan_backup_service tail -n 200 /home/david/logs/backup.log
 # Container-level logs (entrypoint + cron daemon only)
 docker logs -f alan_backup_service
 
-# Disk usage of backup tree
+# Disk usage of backup trees (primary + archive)
 du -sh /mnt/shared/alan/backups/*
+du -sh /mnt/shared/object_storage/backup_archives/*
+
+# Last archival result
+cat /mnt/shared/alan/services/health_checks/status/archive_last_run.json | jq
 ```
 
 ## Troubleshooting
+
+### Email says "archive warning" / archival skipped
+
+The archive dir was missing or not writable at run time — files simply stayed
+in the primary (nothing is lost). Check:
+
+```bash
+ls -ld /mnt/shared/object_storage/backup_archives   # must exist, owned 1000:1000
+sudo chown 1000:1000 /mnt/shared/object_storage/backup_archives
+```
+
+After (re)mounting the cheap disk at `/mnt/shared/object_storage`, re-check
+ownership — fresh mounts come up root-owned. The container's bind mount uses
+`rslave` propagation, so a mount appearing later is picked up without a
+container restart; the next 3 AM run archives the backlog automatically.
 
 ### `docker compose logs backup` shows nothing about backups
 
