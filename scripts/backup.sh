@@ -1208,6 +1208,9 @@ setup_archive_remote() {
     export RCLONE_CONFIG_ARCHIVE_ENDPOINT="${ARCHIVE_S3_ENDPOINT}"
     export RCLONE_CONFIG_ARCHIVE_ACCESS_KEY_ID="${access_key}"
     export RCLONE_CONFIG_ARCHIVE_SECRET_ACCESS_KEY="${secret_key}"
+    # The bucket already exists and the key may not create buckets; without
+    # this rclone's pre-upload bucket check attempts CreateBucket and 403s
+    export RCLONE_CONFIG_ARCHIVE_NO_CHECK_BUCKET=true
     return 0
 }
 
