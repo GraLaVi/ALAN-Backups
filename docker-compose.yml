@@ -58,6 +58,9 @@ services:
       - KEEP_WEEKLY=2              # newest N weeklies kept in primary per backup set
       - ARCHIVE_ROOT=/backup_archives
       - ARCHIVE_RETENTION_DAYS=180 # purge archived backups after 6 months
+      # ARCHIVE_REMOTE (unset in dev) switches archival from filesystem copies
+      # into ARCHIVE_ROOT to direct rclone uploads (bucket/prefix); set in
+      # docker-compose.prod.yml where the archive is a DO Spaces bucket.
       - TZ=America/New_York
 
       # Environment and notification configuration

@@ -64,23 +64,48 @@ Container name: `alan_backup_service`. Service name (for `docker compose`): `bac
 
 ## Retention & archival
 
-After every run, old backups are **moved** (verified copy: size + md5, `gzip -t`
-for dumps) to the cold-storage archive instead of being deleted:
+After every run, old backups are **moved** (verified copy, then delete source)
+to the cold-storage archive instead of being deleted:
 
 - Primary (`/mnt/shared/alan/backups`) keeps the newest **`KEEP_DAILY=1`** file
   in each `daily/` and the newest **`KEEP_WEEKLY=2`** in each `weekly/`, per
   file prefix (per database for postgresql; `backup-*`/`definitions-*` for the
-  volume backups). Everything older moves to
-  `/mnt/shared/object_storage/backup_archives/{service}/{daily,weekly}/`.
+  volume backups). Everything older moves to the archive under
+  `backup_archives/{service}/{daily,weekly}/`.
 - Archive: files older than **`ARCHIVE_RETENTION_DAYS=180`** days (by original
-  backup mtime — `cp -p` preserves it) are deleted from the archive.
+  backup mtime, which both transports preserve) are deleted from the archive.
 - `postgresql/errors/` logs: still deleted after 30 days (not archived).
 - A file is never removed from the primary unless its archive copy verified.
-  If the archive dir is missing/unwritable, archival is **skipped** (files stay
-  put), the run still succeeds, and the notification email carries a warning.
-- The archive path is intended to be a cheaper/slower disk mounted at
-  `/mnt/shared/object_storage`; the bind mount uses `rslave` propagation so the
-  container picks the mount up even if it appears after container start.
+  If the archive target is missing/unwritable, archival is **skipped** (files
+  stay put), the run still succeeds, and the notification email carries a
+  warning.
+
+### Archive transports
+
+- **Remote / rclone (prod)** — set `ARCHIVE_REMOTE=<bucket>/<prefix>`
+  (prod: `gph-shared-plus/backup_archives`, see `docker-compose.prod.yml`).
+  Files are uploaded straight to DO Spaces with `rclone copyto` using
+  credentials parsed from the s3fs passwd file mounted at
+  `ARCHIVE_S3_CREDS_FILE` (`/etc/passwd-s3fs`). Verification: rclone
+  Content-MD5-checks every part in transit, and the script re-checks the
+  remote object size before deleting the source. Prune runs via
+  `rclone delete --min-age`.
+
+  **Why not write through the s3fs mount?** DO Spaces does not implement
+  `UploadPartCopy`. s3fs flushes mid-write once 5GB of dirty data accumulates
+  (`max_dirty_data` default) and then needs that API to assemble the final
+  object, so any file **>5GB written through s3fs fails with EIO** at close.
+  This silently broke `alan_business` (~10.7GB) archival in Jul 2026; every
+  smaller file worked, which made it look database-specific.
+- **Filesystem (dev / no `ARCHIVE_REMOTE`)** — verified copy (size + md5,
+  `gzip -t` for dumps) into the `ARCHIVE_ROOT` bind mount
+  (`/mnt/shared/object_storage/backup_archives` on the host), then delete
+  source. The bind mount uses `rslave` propagation so the container picks the
+  mount up even if it appears after container start.
+
+The host s3fs mount at `/mnt/shared/object_storage` is still handy for
+*browsing/restoring* archived files in prod; it is just no longer in the
+upload path.
 
 ## Manually running a backup
 
@@ -168,7 +193,7 @@ The email body (rewritten in `notify.sh`) now includes:
 1. **Header** — `Status`, `Timestamp`, `Duration`, `Failed Services: N/M` (computed from the actual status files, including each PostgreSQL DB).
 2. **Failures** — only present when something failed. Lists every failed item with its `message` and (for PostgreSQL) `error_detail`. Each field is truncated to **700 chars** with a `…(truncated)` marker so a long `pg_dump` stderr doesn't blow up the email.
 3. **Service Status** — per-service line for RabbitMQ / Loki / Grafana with size + duration, plus a **PostgreSQL** subsection with one row per database.
-4. **Archive (cold storage)** — status, files/bytes moved, files pruned; a `WARNING:` line when archival was skipped or files failed verification.
+4. **Archive (cold storage)** — status, files/bytes moved, files pruned; a `WARNING:` line when archival was skipped or files failed to archive.
 5. **Backup location, retention, next scheduled** — footer info.
 
 Subject line:

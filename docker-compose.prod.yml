@@ -13,3 +13,15 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-pgbkup}
       - POSTGRES_PASS=${POSTGRES_PASSWORD:-wjJf6aYvbw8CMGc0j}
       - POSTGRES_DB=${POSTGRES_DB:-alandb}
+
+      # Archive uploads go directly to DO Spaces via rclone instead of the
+      # s3fs mount: Spaces has no UploadPartCopy support, so s3fs fails with
+      # EIO on any file over 5GB (broke alan_business archival, Jul 2026).
+      # Credentials are reused from the host's s3fs passwd file (see volumes).
+      - ARCHIVE_REMOTE=gph-shared-plus/backup_archives
+      - ARCHIVE_S3_ENDPOINT=https://nyc3.digitaloceanspaces.com
+      - ARCHIVE_S3_CREDS_FILE=/etc/passwd-s3fs
+
+    volumes:
+      # Spaces credentials for rclone (same file s3fs uses on the host)
+      - /etc/passwd-s3fs:/etc/passwd-s3fs:ro

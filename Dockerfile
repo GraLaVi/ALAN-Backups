@@ -9,7 +9,8 @@ RUN apk add --no-cache \
     jq \
     tzdata \
     dcron \
-    postgresql17-client
+    postgresql17-client \
+    rclone
 
 # Create docker group with GID 988 (matching host docker group)
 # This allows access to /var/run/docker.sock when mounted

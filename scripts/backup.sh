@@ -25,6 +25,16 @@ RETENTION_ERROR_LOGS=${RETENTION_ERROR_LOGS:-30}  # Keep error logs for 30 days
 ARCHIVE_ROOT=${ARCHIVE_ROOT:-/backup_archives}
 ARCHIVE_RETENTION_DAYS=${ARCHIVE_RETENTION_DAYS:-180}  # purge archived files older than this
 
+# Remote archive transport. When ARCHIVE_REMOTE is set (bucket/prefix, e.g.
+# "gph-shared-plus/backup_archives"), archival uploads directly to S3-compatible
+# storage with rclone instead of copying into the ARCHIVE_ROOT mount. Required
+# for DO Spaces: it has no UploadPartCopy support, so writing files >5GB
+# through s3fs fails with EIO (s3fs needs the copy API to stitch the final
+# object once max_dirty_data forces a mid-write flush).
+ARCHIVE_REMOTE=${ARCHIVE_REMOTE:-}
+ARCHIVE_S3_ENDPOINT=${ARCHIVE_S3_ENDPOINT:-https://nyc3.digitaloceanspaces.com}
+ARCHIVE_S3_CREDS_FILE=${ARCHIVE_S3_CREDS_FILE:-/etc/passwd-s3fs}  # s3fs passwd format: [bucket:]ACCESS:SECRET
+
 # Archive run counters (read by generate_summary / write_archive_status)
 ARCHIVE_STATUS="success"        # success | skipped | partial_failure
 ARCHIVE_SKIP_REASON=""
@@ -1168,8 +1178,52 @@ backup_postgresql() {
     fi
 }
 
+# Configure the rclone "archive" remote from the s3fs-style credentials file;
+# sets ARCHIVE_SKIP_REASON on failure
+setup_archive_remote() {
+    if ! command -v rclone >/dev/null 2>&1; then
+        ARCHIVE_SKIP_REASON="ARCHIVE_REMOTE is set but rclone is not installed"
+        return 1
+    fi
+    if [ ! -r "${ARCHIVE_S3_CREDS_FILE}" ]; then
+        ARCHIVE_SKIP_REASON="cannot read S3 credentials file ${ARCHIVE_S3_CREDS_FILE}"
+        return 1
+    fi
+
+    # passwd-s3fs format: ACCESS:SECRET or bucket:ACCESS:SECRET
+    local creds_line=$(grep -v '^[[:space:]]*#' "${ARCHIVE_S3_CREDS_FILE}" | grep ':' | head -1)
+    local nfields=$(echo "${creds_line}" | awk -F: '{print NF}')
+    local access_key secret_key
+    case "${nfields}" in
+        2) access_key=$(echo "${creds_line}" | cut -d: -f1)
+           secret_key=$(echo "${creds_line}" | cut -d: -f2) ;;
+        3) access_key=$(echo "${creds_line}" | cut -d: -f2)
+           secret_key=$(echo "${creds_line}" | cut -d: -f3) ;;
+        *) ARCHIVE_SKIP_REASON="unrecognized credentials format in ${ARCHIVE_S3_CREDS_FILE}"
+           return 1 ;;
+    esac
+
+    export RCLONE_CONFIG_ARCHIVE_TYPE=s3
+    export RCLONE_CONFIG_ARCHIVE_PROVIDER=DigitalOcean
+    export RCLONE_CONFIG_ARCHIVE_ENDPOINT="${ARCHIVE_S3_ENDPOINT}"
+    export RCLONE_CONFIG_ARCHIVE_ACCESS_KEY_ID="${access_key}"
+    export RCLONE_CONFIG_ARCHIVE_SECRET_ACCESS_KEY="${secret_key}"
+    return 0
+}
+
 # Check the archive target is usable; sets ARCHIVE_SKIP_REASON when not
 archive_target_ok() {
+    if [ -n "${ARCHIVE_REMOTE}" ]; then
+        setup_archive_remote || return 1
+        # Round-trip write test against the bucket
+        if ! (echo "write test" | rclone rcat "archive:${ARCHIVE_REMOTE}/.write_test" 2>/dev/null \
+                && rclone deletefile "archive:${ARCHIVE_REMOTE}/.write_test" 2>/dev/null); then
+            ARCHIVE_SKIP_REASON="archive remote archive:${ARCHIVE_REMOTE} is not writable"
+            return 1
+        fi
+        return 0
+    fi
+
     if [ ! -d "${ARCHIVE_ROOT}" ]; then
         ARCHIVE_SKIP_REASON="archive root ${ARCHIVE_ROOT} does not exist"
         return 1
@@ -1181,13 +1235,57 @@ archive_target_ok() {
     return 0
 }
 
-# Move one file to the archive: copy + verify + remove source.
+# Move one file to the archive: copy + verify + remove source. Dispatches on
+# ARCHIVE_REMOTE; both transports take (src_path, "service/tier").
+archive_one_file() {
+    if [ -n "${ARCHIVE_REMOTE}" ]; then
+        archive_one_file_remote "$@"
+    else
+        archive_one_file_local "$@"
+    fi
+}
+
+# Upload one file to the S3 archive with rclone, then remove the source.
+# No .partial dance here: an S3 multipart upload is atomic (the object only
+# appears after a successful CompleteMultipartUpload), every part is
+# Content-MD5-verified in transit, and we re-check the remote size before
+# deleting the source. No gzip -t read-back either — that would re-download
+# the whole file from the bucket.
+archive_one_file_remote() {
+    local src=$1
+    local subdir=$2
+    local fname=$(basename "$src")
+    local dst="archive:${ARCHIVE_REMOTE}/${subdir}/${fname}"
+    local src_size=$(stat -c%s "$src" 2>/dev/null || echo 0)
+
+    local rclone_err
+    if ! rclone_err=$(rclone copyto "$src" "$dst" \
+            --s3-chunk-size 64M --s3-upload-cutoff 64M \
+            --retries 3 --low-level-retries 10 2>&1 >/dev/null); then
+        log "WARNING: Upload to archive failed for ${fname}: $(echo "${rclone_err}" | tail -2 | tr '\n' ' ')"
+        return 1
+    fi
+
+    local dst_size=$(rclone lsjson "$dst" 2>/dev/null | jq -r '.[0].Size' 2>/dev/null || echo "")
+    if [ "${dst_size}" != "${src_size}" ]; then
+        log "ERROR: Size mismatch after uploading ${fname} (local ${src_size}, remote ${dst_size:-unknown}); keeping primary copy"
+        return 1
+    fi
+
+    rm -f "$src"
+    ARCHIVE_FILES_MOVED=$((ARCHIVE_FILES_MOVED + 1))
+    ARCHIVE_BYTES_MOVED=$((ARCHIVE_BYTES_MOVED + src_size))
+    log "Archived: ${fname} -> archive:${ARCHIVE_REMOTE}/${subdir}"
+    return 0
+}
+
+# Filesystem-archive variant (dev, or any mounted archive disk).
 # NEVER deletes the source unless the archive copy verified. Uses explicit
 # cp+verify+rm rather than mv: across the bind-mount boundary mv degrades to
 # an unverified copy+unlink (EXDEV).
-archive_one_file() {
+archive_one_file_local() {
     local src=$1
-    local dst_dir=$2
+    local dst_dir="${ARCHIVE_ROOT}/$2"
     local fname=$(basename "$src")
     local dst="${dst_dir}/${fname}"
     local partial="${dst}.partial"
@@ -1218,8 +1316,9 @@ archive_one_file() {
 
     # cp -p preserves mtime so the ARCHIVE_RETENTION_DAYS prune ages files
     # from when the backup was taken, not when it was archived.
-    if ! cp -p "$src" "$partial" 2>/dev/null; then
-        log "WARNING: Copy to archive failed for ${fname}"
+    local cp_err
+    if ! cp_err=$(cp -p "$src" "$partial" 2>&1); then
+        log "WARNING: Copy to archive failed for ${fname}: $(echo "${cp_err}" | tail -2 | tr '\n' ' ')"
         rm -f "$partial" 2>/dev/null || true
         return 1
     fi
@@ -1252,17 +1351,28 @@ archive_one_file() {
     return 0
 }
 
-# Purge archived files older than ARCHIVE_RETENTION_DAYS (mtime-based; cp -p
-# preserved the original backup mtime). Also clears stale .partial files.
+# Purge archived files older than ARCHIVE_RETENTION_DAYS (mtime-based: cp -p
+# preserves the original backup mtime, and rclone stores it as object
+# metadata that --min-age honors). Also clears stale .partial files.
 prune_archive() {
-    local before=$(find "${ARCHIVE_ROOT}" -type f \
-        \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
-        -mtime +${ARCHIVE_RETENTION_DAYS} 2>/dev/null | wc -l || echo 0)
-    find "${ARCHIVE_ROOT}" -type f \
-        \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
-        -mtime +${ARCHIVE_RETENTION_DAYS} -delete 2>/dev/null || true
-    find "${ARCHIVE_ROOT}" -type f -name '*.partial' -mtime +2 -delete 2>/dev/null || true
-    ARCHIVE_FILES_PRUNED=${before}
+    if [ -n "${ARCHIVE_REMOTE}" ]; then
+        local before=$(rclone lsf "archive:${ARCHIVE_REMOTE}" -R --files-only \
+            --min-age "${ARCHIVE_RETENTION_DAYS}d" 2>/dev/null | wc -l || echo 0)
+        if [ "${before}" -gt 0 ]; then
+            rclone delete "archive:${ARCHIVE_REMOTE}" \
+                --min-age "${ARCHIVE_RETENTION_DAYS}d" 2>/dev/null || true
+        fi
+        ARCHIVE_FILES_PRUNED=${before}
+    else
+        local before=$(find "${ARCHIVE_ROOT}" -type f \
+            \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
+            -mtime +${ARCHIVE_RETENTION_DAYS} 2>/dev/null | wc -l || echo 0)
+        find "${ARCHIVE_ROOT}" -type f \
+            \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
+            -mtime +${ARCHIVE_RETENTION_DAYS} -delete 2>/dev/null || true
+        find "${ARCHIVE_ROOT}" -type f -name '*.partial' -mtime +2 -delete 2>/dev/null || true
+        ARCHIVE_FILES_PRUNED=${before}
+    fi
     if [ "${ARCHIVE_FILES_PRUNED}" -gt 0 ]; then
         log "Pruned ${ARCHIVE_FILES_PRUNED} archived file(s) older than ${ARCHIVE_RETENTION_DAYS} days"
     fi
@@ -1270,11 +1380,14 @@ prune_archive() {
 
 # Write archive status JSON for API / notification integration
 write_archive_status() {
+    local target="${ARCHIVE_ROOT}"
+    [ -n "${ARCHIVE_REMOTE}" ] && target="archive:${ARCHIVE_REMOTE}"
+
     local message="Archived ${ARCHIVE_FILES_MOVED} file(s)"
     if [ -n "${ARCHIVE_SKIP_REASON}" ]; then
         message="${ARCHIVE_SKIP_REASON}"
     elif [ "${ARCHIVE_FILES_FAILED}" -gt 0 ]; then
-        message="Archived ${ARCHIVE_FILES_MOVED} file(s); ${ARCHIVE_FILES_FAILED} failed verification and stayed in primary"
+        message="Archived ${ARCHIVE_FILES_MOVED} file(s); ${ARCHIVE_FILES_FAILED} failed to archive and stayed in primary"
     fi
 
     cat > "${STATUS_ROOT}/archive_last_run.json" <<EOF
@@ -1283,7 +1396,7 @@ write_archive_status() {
   "status": "$(escape_json_string "${ARCHIVE_STATUS}")",
   "message": "$(escape_json_string "${message}")",
   "timestamp": "$(date -Iseconds)",
-  "archive_root": "${ARCHIVE_ROOT}",
+  "archive_root": "$(escape_json_string "${target}")",
   "files_moved": ${ARCHIVE_FILES_MOVED},
   "bytes_moved": ${ARCHIVE_BYTES_MOVED},
   "files_failed": ${ARCHIVE_FILES_FAILED},
@@ -1294,10 +1407,13 @@ EOF
 
 # Archive old backups to cold storage. Keeps the newest KEEP_DAILY files in
 # each daily/ and KEEP_WEEKLY in each weekly/ per file prefix (per database
-# for postgresql); moves everything older to ARCHIVE_ROOT mirroring the
+# for postgresql); moves everything older to the archive target (ARCHIVE_ROOT
+# mount, or the ARCHIVE_REMOTE bucket via rclone) mirroring the
 # {service}/{daily,weekly} layout. Never fails the backup run.
 archive_old_backups() {
-    log "Archiving old backups to ${ARCHIVE_ROOT}..."
+    local archive_target="${ARCHIVE_ROOT}"
+    [ -n "${ARCHIVE_REMOTE}" ] && archive_target="archive:${ARCHIVE_REMOTE}"
+    log "Archiving old backups to ${archive_target}..."
 
     if ! archive_target_ok; then
         ARCHIVE_STATUS="skipped"
@@ -1306,7 +1422,7 @@ archive_old_backups() {
         return 0
     fi
 
-    local service tier keep src_dir dst_dir groups group_line prefix ext old_files f
+    local service tier keep src_dir subdir groups group_line prefix ext old_files f
     for service in rabbitmq loki grafana postgresql; do
         for tier in daily weekly; do
             if [ "$tier" = "daily" ]; then
@@ -1315,7 +1431,7 @@ archive_old_backups() {
                 keep=${KEEP_WEEKLY}
             fi
             src_dir="${BACKUP_ROOT}/${service}/${tier}"
-            dst_dir="${ARCHIVE_ROOT}/${service}/${tier}"
+            subdir="${service}/${tier}"
             [ -d "$src_dir" ] || continue
 
             # Distinct "prefix|ext" groups, e.g. "alandb|.sql.gz",
@@ -1339,7 +1455,7 @@ archive_old_backups() {
                     | sort -r | tail -n +$((keep + 1)) || true)
                 [ -n "$old_files" ] || continue
                 for f in $old_files; do
-                    if ! archive_one_file "$f" "$dst_dir"; then
+                    if ! archive_one_file "$f" "$subdir"; then
                         ARCHIVE_FILES_FAILED=$((ARCHIVE_FILES_FAILED + 1))
                     fi
                 done
