@@ -17,10 +17,12 @@ services:
       # Archive uploads go directly to DO Spaces via rclone instead of the
       # s3fs mount: Spaces has no UploadPartCopy support, so s3fs fails with
       # EIO on any file over 5GB (broke alan_business archival, Jul 2026).
-      # Credentials are reused from the host's s3fs passwd file (see volumes).
+      # Credentials are reused from the host's s3fs passwd file (mounted ro,
+      # see volumes; root:600, so the entrypoint stages a david-readable copy
+      # at /run/s3fs-creds).
       - ARCHIVE_REMOTE=gph-shared-plus/backup_archives
       - ARCHIVE_S3_ENDPOINT=https://nyc3.digitaloceanspaces.com
-      - ARCHIVE_S3_CREDS_FILE=/etc/passwd-s3fs
+      - ARCHIVE_S3_CREDS_FILE=/run/s3fs-creds
 
     volumes:
       # Spaces credentials for rclone (same file s3fs uses on the host)

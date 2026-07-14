@@ -85,8 +85,10 @@ to the cold-storage archive instead of being deleted:
 - **Remote / rclone (prod)** — set `ARCHIVE_REMOTE=<bucket>/<prefix>`
   (prod: `gph-shared-plus/backup_archives`, see `docker-compose.prod.yml`).
   Files are uploaded straight to DO Spaces with `rclone copyto` using
-  credentials parsed from the s3fs passwd file mounted at
-  `ARCHIVE_S3_CREDS_FILE` (`/etc/passwd-s3fs`). Verification: rclone
+  credentials parsed from the host's s3fs passwd file (mounted read-only at
+  `/etc/passwd-s3fs`; since it is root:600, the entrypoint stages a
+  david-readable copy at `/run/s3fs-creds` = `ARCHIVE_S3_CREDS_FILE`).
+  Verification: rclone
   Content-MD5-checks every part in transit, and the script re-checks the
   remote object size before deleting the source. Prune runs via
   `rclone delete --min-age`.

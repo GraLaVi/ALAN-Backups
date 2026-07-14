@@ -95,6 +95,10 @@ services:
         (touch /tmp/backups/.write_test 2>/dev/null && rm -f /tmp/backups/.write_test && echo '✓ /tmp/backups is writable') || echo 'WARNING: /tmp/backups may not be writable by UID 1000' && \
         (touch /services/.write_test 2>/dev/null && rm -f /services/.write_test && echo '✓ /services is writable') || echo 'WARNING: /services may not be writable by UID 1000' && \
         (touch /backup_archives/.write_test 2>/dev/null && rm -f /backup_archives/.write_test && echo '✓ /backup_archives is writable') || echo 'WARNING: /backup_archives not writable — archival will be skipped' && \
+        # Stage S3 archive credentials for the backup user: the mounted
+        # passwd-s3fs is root:600 on the host (s3fs requires that), but cron
+        # runs backup.sh as david, so copy it somewhere david can read
+        if [ -f /etc/passwd-s3fs ]; then cp /etc/passwd-s3fs /run/s3fs-creds && chown david:david /run/s3fs-creds && chmod 400 /run/s3fs-creds && echo '✓ S3 archive credentials staged at /run/s3fs-creds'; fi && \
         # Ensure scripts are executable
         chmod +x /usr/local/bin/backup.sh /usr/local/bin/notify.sh && \
         # Write cron job to user crontab
