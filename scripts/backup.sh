@@ -1216,9 +1216,10 @@ archive_target_ok() {
     if [ -n "${ARCHIVE_REMOTE}" ]; then
         setup_archive_remote || return 1
         # Round-trip write test against the bucket
-        if ! (echo "write test" | rclone rcat "archive:${ARCHIVE_REMOTE}/.write_test" 2>/dev/null \
-                && rclone deletefile "archive:${ARCHIVE_REMOTE}/.write_test" 2>/dev/null); then
-            ARCHIVE_SKIP_REASON="archive remote archive:${ARCHIVE_REMOTE} is not writable"
+        local rcat_err
+        if ! rcat_err=$( { echo "write test" | rclone rcat "archive:${ARCHIVE_REMOTE}/.write_test" \
+                && rclone deletefile "archive:${ARCHIVE_REMOTE}/.write_test"; } 2>&1 >/dev/null ); then
+            ARCHIVE_SKIP_REASON="archive remote archive:${ARCHIVE_REMOTE} is not writable: $(echo "${rcat_err}" | tail -2 | tr '\n' ' ')"
             return 1
         fi
         return 0
