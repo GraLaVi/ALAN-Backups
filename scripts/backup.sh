@@ -18,12 +18,22 @@ WEEKDAY=$(date +%u)  # 1=Monday, 7=Sunday
 # Primary keeps only the newest backups; everything older is MOVED (verified
 # copy) to the cold-storage archive at ARCHIVE_ROOT instead of deleted.
 KEEP_DAILY=${KEEP_DAILY:-1}        # newest N files kept in each daily/ per prefix
-KEEP_WEEKLY=${KEEP_WEEKLY:-2}      # newest N files kept in each weekly/ per prefix
+KEEP_WEEKLY=${KEEP_WEEKLY:-1}      # newest N files kept in each weekly/ per prefix
 RETENTION_ERROR_LOGS=${RETENTION_ERROR_LOGS:-30}  # Keep error logs for 30 days
 
 # Archival settings (cold storage; host: /mnt/shared/object_storage/backup_archives)
 ARCHIVE_ROOT=${ARCHIVE_ROOT:-/backup_archives}
-ARCHIVE_RETENTION_DAYS=${ARCHIVE_RETENTION_DAYS:-180}  # purge archived files older than this
+# Archive retention is per tier, aged by ORIGINAL backup mtime (both transports
+# preserve it), not by when the file was archived.
+ARCHIVE_RETENTION_DAILY_DAYS=${ARCHIVE_RETENTION_DAILY_DAYS:-7}    # archived */daily/
+ARCHIVE_RETENTION_WEEKLY_DAYS=${ARCHIVE_RETENTION_WEEKLY_DAYS:-30} # archived */weekly/
+# Catch-all for anything in the archive outside the {service}/{daily,weekly}
+# layout. Near-dead today; it exists so a stray file cannot live forever.
+ARCHIVE_RETENTION_DAYS=${ARCHIVE_RETENTION_DAYS:-180}
+
+# When set (true/1/yes/on), the prune logs what it WOULD delete and deletes
+# nothing. Intended for the first run after tightening retention.
+ARCHIVE_PRUNE_DRY_RUN=${ARCHIVE_PRUNE_DRY_RUN:-false}
 
 # Remote archive transport. When ARCHIVE_REMOTE is set (bucket/prefix, e.g.
 # "gph-shared-plus/backup_archives"), archival uploads directly to S3-compatible
@@ -41,7 +51,8 @@ ARCHIVE_SKIP_REASON=""
 ARCHIVE_FILES_MOVED=0
 ARCHIVE_BYTES_MOVED=0
 ARCHIVE_FILES_FAILED=0
-ARCHIVE_FILES_PRUNED=0
+ARCHIVE_FILES_PRUNED=0            # actually deleted (stays 0 under dry run)
+ARCHIVE_PRUNE_CANDIDATES=0        # matched the retention windows
 
 # Timeout settings
 BACKUP_TIMEOUT=${BACKUP_TIMEOUT:-7200}  # Default 2 hours for large databases
@@ -1355,30 +1366,99 @@ archive_one_file_local() {
     return 0
 }
 
-# Purge archived files older than ARCHIVE_RETENTION_DAYS (mtime-based: cp -p
-# preserves the original backup mtime, and rclone stores it as object
-# metadata that --min-age honors). Also clears stale .partial files.
-prune_archive() {
-    if [ -n "${ARCHIVE_REMOTE}" ]; then
-        local before=$(rclone lsf "archive:${ARCHIVE_REMOTE}" -R --files-only \
-            --min-age "${ARCHIVE_RETENTION_DAYS}d" 2>/dev/null | wc -l || echo 0)
-        if [ "${before}" -gt 0 ]; then
-            rclone delete "archive:${ARCHIVE_REMOTE}" \
-                --min-age "${ARCHIVE_RETENTION_DAYS}d" 2>/dev/null || true
-        fi
-        ARCHIVE_FILES_PRUNED=${before}
-    else
-        local before=$(find "${ARCHIVE_ROOT}" -type f \
+# Is the prune in dry-run mode? Accepts true/1/yes/on, any casing — a typo'd
+# value must not silently fall through to a real delete.
+archive_prune_is_dry_run() {
+    case "$(echo "${ARCHIVE_PRUNE_DRY_RUN}" | tr '[:upper:]' '[:lower:]')" in
+        true|1|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# One filesystem-archive retention sweep.
+#   $1 label, $2 max age in days, $3.. extra find predicates (the tier selector)
+prune_sweep_local() {
+    local label=$1 days=$2
+    shift 2
+    local n
+    n=$(find "${ARCHIVE_ROOT}" -type f "$@" \
             \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
-            -mtime +${ARCHIVE_RETENTION_DAYS} 2>/dev/null | wc -l || echo 0)
-        find "${ARCHIVE_ROOT}" -type f \
-            \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
-            -mtime +${ARCHIVE_RETENTION_DAYS} -delete 2>/dev/null || true
-        find "${ARCHIVE_ROOT}" -type f -name '*.partial' -mtime +2 -delete 2>/dev/null || true
-        ARCHIVE_FILES_PRUNED=${before}
+            -mtime +${days} 2>/dev/null | wc -l || echo 0)
+    n=$(echo "$n" | tr -d ' ')
+    [ "${n}" -gt 0 ] || return 0
+    ARCHIVE_PRUNE_CANDIDATES=$((ARCHIVE_PRUNE_CANDIDATES + n))
+
+    if archive_prune_is_dry_run; then
+        log "DRY RUN: would prune ${n} archived ${label} file(s) older than ${days} days"
+        find "${ARCHIVE_ROOT}" -type f "$@" \
+                \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
+                -mtime +${days} 2>/dev/null | sort | head -20 \
+            | while read -r p; do log "DRY RUN:   ${p}"; done
+        [ "${n}" -gt 20 ] && log "DRY RUN:   ... and $((n - 20)) more"
+        return 0
     fi
-    if [ "${ARCHIVE_FILES_PRUNED}" -gt 0 ]; then
-        log "Pruned ${ARCHIVE_FILES_PRUNED} archived file(s) older than ${ARCHIVE_RETENTION_DAYS} days"
+
+    find "${ARCHIVE_ROOT}" -type f "$@" \
+        \( -name '*.sql.gz' -o -name '*.tar.gz' -o -name '*.json' \) \
+        -mtime +${days} -delete 2>/dev/null || true
+    ARCHIVE_FILES_PRUNED=$((ARCHIVE_FILES_PRUNED + n))
+    log "Pruned ${n} archived ${label} file(s) older than ${days} days"
+}
+
+# One remote-archive retention sweep.
+#   $1 label, $2 max age in days, $3.. rclone filter flags (the tier selector)
+prune_sweep_remote() {
+    local label=$1 days=$2
+    shift 2
+    local n
+    n=$(rclone lsf "archive:${ARCHIVE_REMOTE}" -R --files-only "$@" \
+            --min-age "${days}d" 2>/dev/null | wc -l || echo 0)
+    n=$(echo "$n" | tr -d ' ')
+    [ "${n}" -gt 0 ] || return 0
+    ARCHIVE_PRUNE_CANDIDATES=$((ARCHIVE_PRUNE_CANDIDATES + n))
+
+    if archive_prune_is_dry_run; then
+        log "DRY RUN: would prune ${n} archived ${label} file(s) older than ${days} days"
+        rclone lsf "archive:${ARCHIVE_REMOTE}" -R --files-only "$@" \
+                --min-age "${days}d" 2>/dev/null | sort | head -20 \
+            | while read -r p; do log "DRY RUN:   ${p}"; done
+        [ "${n}" -gt 20 ] && log "DRY RUN:   ... and $((n - 20)) more"
+        return 0
+    fi
+
+    rclone delete "archive:${ARCHIVE_REMOTE}" "$@" \
+        --min-age "${days}d" 2>/dev/null || true
+    ARCHIVE_FILES_PRUNED=$((ARCHIVE_FILES_PRUNED + n))
+    log "Pruned ${n} archived ${label} file(s) older than ${days} days"
+}
+
+# Purge archived files past their tier's retention window. Ages are mtime-based
+# (cp -p preserves the original backup mtime, and rclone stores it as object
+# metadata that --min-age honors), so a file is judged on when the backup was
+# taken, not when it was archived. Also clears stale .partial files.
+# Under ARCHIVE_PRUNE_DRY_RUN nothing is deleted at all.
+prune_archive() {
+    if archive_prune_is_dry_run; then
+        log "DRY RUN: archive prune will report only; no files will be deleted"
+    fi
+
+    if [ -n "${ARCHIVE_REMOTE}" ]; then
+        prune_sweep_remote "daily"  "${ARCHIVE_RETENTION_DAILY_DAYS}"  --include "/*/daily/**"
+        prune_sweep_remote "weekly" "${ARCHIVE_RETENTION_WEEKLY_DAYS}" --include "/*/weekly/**"
+        prune_sweep_remote "other"  "${ARCHIVE_RETENTION_DAYS}" \
+            --exclude "/*/daily/**" --exclude "/*/weekly/**"
+    else
+        prune_sweep_local "daily"  "${ARCHIVE_RETENTION_DAILY_DAYS}"  -path '*/daily/*'
+        prune_sweep_local "weekly" "${ARCHIVE_RETENTION_WEEKLY_DAYS}" -path '*/weekly/*'
+        prune_sweep_local "other"  "${ARCHIVE_RETENTION_DAYS}" \
+            ! -path '*/daily/*' ! -path '*/weekly/*'
+        if ! archive_prune_is_dry_run; then
+            find "${ARCHIVE_ROOT}" -type f -name '*.partial' -mtime +2 -delete 2>/dev/null || true
+        fi
+    fi
+
+    if archive_prune_is_dry_run; then
+        log "DRY RUN: ${ARCHIVE_PRUNE_CANDIDATES} archived file(s) matched retention; none deleted"
     fi
 }
 
@@ -1387,11 +1467,17 @@ write_archive_status() {
     local target="${ARCHIVE_ROOT}"
     [ -n "${ARCHIVE_REMOTE}" ] && target="archive:${ARCHIVE_REMOTE}"
 
+    local dry_run="false"
+    archive_prune_is_dry_run && dry_run="true"
+
     local message="Archived ${ARCHIVE_FILES_MOVED} file(s)"
     if [ -n "${ARCHIVE_SKIP_REASON}" ]; then
         message="${ARCHIVE_SKIP_REASON}"
     elif [ "${ARCHIVE_FILES_FAILED}" -gt 0 ]; then
         message="Archived ${ARCHIVE_FILES_MOVED} file(s); ${ARCHIVE_FILES_FAILED} failed to archive and stayed in primary"
+    fi
+    if [ "${dry_run}" = "true" ]; then
+        message="${message}. DRY RUN: ${ARCHIVE_PRUNE_CANDIDATES} archived file(s) matched retention but were NOT deleted"
     fi
 
     cat > "${STATUS_ROOT}/archive_last_run.json" <<EOF
@@ -1404,7 +1490,9 @@ write_archive_status() {
   "files_moved": ${ARCHIVE_FILES_MOVED},
   "bytes_moved": ${ARCHIVE_BYTES_MOVED},
   "files_failed": ${ARCHIVE_FILES_FAILED},
-  "files_pruned": ${ARCHIVE_FILES_PRUNED}
+  "files_pruned": ${ARCHIVE_FILES_PRUNED},
+  "prune_dry_run": ${dry_run},
+  "prune_candidates": ${ARCHIVE_PRUNE_CANDIDATES}
 }
 EOF
 }
@@ -1475,7 +1563,7 @@ EOF
         ARCHIVE_STATUS="partial_failure"
     fi
     write_archive_status
-    log "Archival done: moved=${ARCHIVE_FILES_MOVED} failed=${ARCHIVE_FILES_FAILED} pruned=${ARCHIVE_FILES_PRUNED}"
+    log "Archival done: moved=${ARCHIVE_FILES_MOVED} failed=${ARCHIVE_FILES_FAILED} pruned=${ARCHIVE_FILES_PRUNED} prune_candidates=${ARCHIVE_PRUNE_CANDIDATES}"
     return 0
 }
 
@@ -1607,6 +1695,8 @@ generate_summary() {
   "retention_policy": {
     "primary_keep_daily": ${KEEP_DAILY},
     "primary_keep_weekly": ${KEEP_WEEKLY},
+    "archive_retention_daily_days": ${ARCHIVE_RETENTION_DAILY_DAYS},
+    "archive_retention_weekly_days": ${ARCHIVE_RETENTION_WEEKLY_DAYS},
     "archive_retention_days": ${ARCHIVE_RETENTION_DAYS}
   },
   "archive": $(cat "${STATUS_ROOT}/archive_last_run.json" 2>/dev/null || echo '{"status": "unknown"}'),

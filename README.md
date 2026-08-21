@@ -68,17 +68,50 @@ After every run, old backups are **moved** (verified copy, then delete source)
 to the cold-storage archive instead of being deleted:
 
 - Primary (`/mnt/shared/alan/backups`) keeps the newest **`KEEP_DAILY=1`** file
-  in each `daily/` and the newest **`KEEP_WEEKLY=2`** in each `weekly/`, per
+  in each `daily/` and the newest **`KEEP_WEEKLY=1`** in each `weekly/`, per
   file prefix (per database for postgresql; `backup-*`/`definitions-*` for the
   volume backups). Everything older moves to the archive under
   `backup_archives/{service}/{daily,weekly}/`.
-- Archive: files older than **`ARCHIVE_RETENTION_DAYS=180`** days (by original
-  backup mtime, which both transports preserve) are deleted from the archive.
+- Archive retention is **per tier**, aged by original backup mtime (which both
+  transports preserve), so a file is judged on when the backup was taken, not
+  when it was archived:
+  - `*/daily/` — **`ARCHIVE_RETENTION_DAILY_DAYS=7`**
+  - `*/weekly/` — **`ARCHIVE_RETENTION_WEEKLY_DAYS=30`**
+  - anything else — **`ARCHIVE_RETENTION_DAYS=180`**, a catch-all so a file
+    outside the `{service}/{daily,weekly}` layout cannot live forever.
+- Steady state per database: 1 daily + 1 weekly in primary, ~7 dailies and 4
+  weeklies in the archive — about five weeks of Sunday coverage.
 - `postgresql/errors/` logs: still deleted after 30 days (not archived).
 - A file is never removed from the primary unless its archive copy verified.
   If the archive target is missing/unwritable, archival is **skipped** (files
   stay put), the run still succeeds, and the notification email carries a
   warning.
+
+### Dry-running the prune
+
+`ARCHIVE_PRUNE_DRY_RUN=true` makes the prune report and delete nothing — the
+log lists up to 20 paths per tier, `archive_last_run.json` carries
+`prune_dry_run` / `prune_candidates`, and the notification email says
+`Pruned: 0 (DRY RUN — N file(s) matched retention, none deleted)`. Archival
+itself (moving files out of primary) still runs normally; only deletion is
+suppressed, including the stale-`.partial` sweep.
+
+Use it for the first run after tightening a retention window, since the prune
+is otherwise silent about what it removed:
+
+```bash
+ARCHIVE_PRUNE_DRY_RUN=true ./start_app.sh --up   # one run, inspect the counts
+./start_app.sh --up                              # then let it prune for real
+```
+
+To check the blast radius without touching the container at all:
+
+```bash
+rclone lsf archive:gph-shared-plus/backup_archives -R --files-only \
+  --include "/*/daily/**"  --min-age 7d  | wc -l
+rclone lsf archive:gph-shared-plus/backup_archives -R --files-only \
+  --include "/*/weekly/**" --min-age 30d | wc -l
+```
 
 ### Archive transports
 

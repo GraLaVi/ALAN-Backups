@@ -222,7 +222,15 @@ generate_email_body() {
     local arch_moved=$(read_status_field "$arch_file" ".files_moved" "0")
     local arch_bytes=$(read_status_field "$arch_file" ".bytes_moved" "0")
     local arch_pruned=$(read_status_field "$arch_file" ".files_pruned" "0")
+    local arch_dry_run=$(read_status_field "$arch_file" ".prune_dry_run" "false")
+    local arch_candidates=$(read_status_field "$arch_file" ".prune_candidates" "0")
     local arch_bytes_human=$(numfmt --to=iec ${arch_bytes} 2>/dev/null || echo "${arch_bytes} bytes")
+
+    # Under a dry-run prune nothing was deleted; say so instead of reporting "0"
+    local arch_prune_line="Pruned: ${arch_pruned} archived file(s) past retention"
+    if [ "$arch_dry_run" = "true" ]; then
+        arch_prune_line="Pruned: 0 (DRY RUN — ${arch_candidates} file(s) matched retention, none deleted)"
+    fi
 
     local archive_warning=""
     if [ "$arch_status" != "success" ] && [ "$arch_status" != "unknown" ]; then
@@ -258,7 +266,7 @@ Archive (cold storage):
 -----------------------
 Status: ${arch_status}
 Moved:  ${arch_moved} file(s) (${arch_bytes_human}) -> ${arch_root}
-Pruned: ${arch_pruned} archived file(s) past retention
+${arch_prune_line}
 ${archive_warning}
 Backup Location:
 ----------------
@@ -267,9 +275,10 @@ Archive: /mnt/shared/object_storage/backup_archives/
 
 Retention Policy:
 -----------------
-Primary keeps newest ${KEEP_DAILY:-1} daily + ${KEEP_WEEKLY:-2} weekly per backup set
+Primary keeps newest ${KEEP_DAILY:-1} daily + ${KEEP_WEEKLY:-1} weekly per backup set
 Older backups are moved (verified copy) to the archive
-Archived backups purged after ${ARCHIVE_RETENTION_DAYS:-180} days
+Archived dailies purged after ${ARCHIVE_RETENTION_DAILY_DAYS:-7} days
+Archived weeklies purged after ${ARCHIVE_RETENTION_WEEKLY_DAYS:-30} days
 PostgreSQL error logs: 30 days
 
 Next Scheduled Backup:

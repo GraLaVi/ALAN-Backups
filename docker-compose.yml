@@ -55,9 +55,15 @@ services:
       # Backup configuration
       - BACKUP_SCHEDULE=0 3 * * *  # 3 AM PST/PDT daily
       - KEEP_DAILY=1               # newest N dailies kept in primary per backup set
-      - KEEP_WEEKLY=2              # newest N weeklies kept in primary per backup set
+      - KEEP_WEEKLY=1              # newest N weeklies kept in primary per backup set
       - ARCHIVE_ROOT=/backup_archives
-      - ARCHIVE_RETENTION_DAYS=180 # purge archived backups after 6 months
+      # Archive retention, per tier, by original backup date
+      - ARCHIVE_RETENTION_DAILY_DAYS=7    # a week of dailies
+      - ARCHIVE_RETENTION_WEEKLY_DAYS=30  # a month of weeklies
+      - ARCHIVE_RETENTION_DAYS=180 # catch-all for files outside daily/ and weekly/
+      # Set true for the first run after tightening retention: the prune logs
+      # what it would delete and deletes nothing. Unset it once the counts look right.
+      - ARCHIVE_PRUNE_DRY_RUN=${ARCHIVE_PRUNE_DRY_RUN:-false}
       # ARCHIVE_REMOTE (unset in dev) switches archival from filesystem copies
       # into ARCHIVE_ROOT to direct rclone uploads (bucket/prefix); set in
       # docker-compose.prod.yml where the archive is a DO Spaces bucket.
